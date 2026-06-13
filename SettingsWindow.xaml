@@ -116,10 +116,10 @@
                         <RowDefinition Height="40"/>
                     </Grid.RowDefinitions>
 
-                    <TextBlock Grid.Row="0" Grid.Column="0" Text="Max context (tokens)" Style="{StaticResource FieldLabel}"/>
+                    <TextBlock Grid.Row="0" Grid.Column="0" Text="Max context (blank = auto)" Style="{StaticResource FieldLabel}"/>
                     <TextBox x:Name="ContextLenBox" Grid.Row="0" Grid.Column="1" Grid.ColumnSpan="2"
                              Style="{StaticResource DarkInput}" VerticalAlignment="Center"
-                             ToolTip="Maximum context window (OLLAMA_CONTEXT_LENGTH and the AutoTune ceiling).&#x0a;AutoTune sizes each model to min(its native window, this value).&#x0a;Higher = more context but more RAM/VRAM; lower to save memory."/>
+                             ToolTip="Runtime context window (OLLAMA_CONTEXT_LENGTH and num_ctx).&#x0a;Leave BLANK for auto: AutoTune uses the model's native window; if AutoTune is off it defaults to 32k.&#x0a;Enter a number to force a specific size.&#x0a;Higher = more context but more RAM/VRAM; lower to save memory."/>
 
                     <TextBlock Grid.Row="1" Grid.Column="0" Text="Max iterations" Style="{StaticResource FieldLabel}"/>
                     <TextBox x:Name="MaxIterBox" Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="2"

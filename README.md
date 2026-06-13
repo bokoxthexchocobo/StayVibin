@@ -117,6 +117,16 @@ Download the latest release from
 - Live token streaming is rendered if the backend emits it; otherwise the final
   message is shown when the turn completes.
 
+## What's new in v1.0.2
+
+- Context cap now supports "auto": leave Settings -> "Max context" blank and
+  AutoTune uses each model's native window; with AutoTune off it defaults to 32k.
+  Enter a number to force a specific size.
+- The context meter updates immediately when you change the cap in Settings (no
+  restart needed) and always reflects the configured runtime window.
+- Server log expander sits flush with the window bottom when collapsed - the empty
+  gap under it is gone; expanding restores a resizable, draggable log panel.
+
 ## What's new in v1.0.1
 
 - Model dropdown refresh button - newly pulled Ollama models appear without a restart.

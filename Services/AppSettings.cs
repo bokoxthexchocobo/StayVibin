@@ -21,12 +21,23 @@ public sealed class AppSettings
     /// <summary>Default working folder for new sessions; empty = user profile.</summary>
     public string DefaultWorkingDir { get; set; } = "";
     /// <summary>
-    /// Maximum context window (tokens). Used as the OLLAMA_CONTEXT_LENGTH the server
-    /// launches with, and as the ceiling for AutoTune: AutoTune sizes each model to
-    /// min(its native window, this value), so small models use less and large models
-    /// are capped here. Raise it for more context (more RAM/VRAM), lower it to save.
+    /// Runtime context window (tokens). 0 means "auto" (the Settings box is empty):
+    /// when AutoTune is on the model's native window is used, otherwise a 32k default
+    /// applies. A positive value is an explicit override that always wins. This is the
+    /// number shown on the context meter and passed to the agent (num_ctx /
+    /// OLLAMA_CONTEXT_LENGTH).
     /// </summary>
-    public int ContextLength { get; set; } = 65536;
+    public int ContextLength { get; set; }   // 0 = auto
+
+    /// <summary>Context used when "auto" can't resolve to a model window.</summary>
+    public const int FallbackContextLength = 32768;
+
+    /// <summary>
+    /// Concrete context for the backend launch env var. Per-request num_ctx still
+    /// overrides this when AutoTune sizes a specific model, so the 32k auto baseline
+    /// here is just a floor for the server's global default.
+    /// </summary>
+    public int BackendContextLength => ContextLength > 0 ? ContextLength : FallbackContextLength;
     /// <summary>Maximum agent loop iterations per conversation.</summary>
     public int MaxIterations { get; set; } = 500;
 
@@ -75,7 +86,8 @@ public sealed class AppSettings
     private AppSettings Normalized()
     {
         if (Port is <= 0 or > 65535) Port = 8000;
-        if (ContextLength < 1024) ContextLength = 65536;
+        // Allow 0 (auto). Any other sub-floor value is coerced to auto.
+        if (ContextLength is not 0 and < 1024) ContextLength = 0;
         if (MaxIterations < 1) MaxIterations = 500;
         if (string.IsNullOrWhiteSpace(Host)) Host = "127.0.0.1";
         if (string.IsNullOrWhiteSpace(OllamaUrl)) OllamaUrl = "http://localhost:11434";

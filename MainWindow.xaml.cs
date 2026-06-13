@@ -70,7 +70,8 @@ public partial class MainWindow : Window
             catch { /* model picker still works once configured */ }
         }
         _ollama = new OllamaClient(_settings.OllamaUrl);
-        _assumedContextWindow = _settings.ContextLength;   // refined per-model on tune
+        // Pre-session placeholder; refined per-model once tuned/started.
+        _assumedContextWindow = _settings.BackendContextLength;
 
         AddSystem("Welcome. Pick a working folder, then press Start to launch the agent.");
         Closing += (_, _) => Cleanup();
@@ -141,10 +142,10 @@ public partial class MainWindow : Window
 
     private BackendManager BuildBackend()
     {
-        _backendContext = _settings.ContextLength;
+        _backendContext = _settings.ContextLength;   // raw setting (0 = auto) for change detection
         var b = new BackendManager(
             _settings.Host, _settings.Port,
-            _settings.EffectiveAgentServerPath, _settings.ContextLength);
+            _settings.EffectiveAgentServerPath, _settings.BackendContextLength);
         b.LogLine += OnBackendLog;
         return b;
     }
@@ -175,7 +176,7 @@ public partial class MainWindow : Window
 
         _ollama?.Dispose();
         _ollama = new OllamaClient(_settings.OllamaUrl);
-        _assumedContextWindow = _settings.ContextLength;   // ceiling may have changed
+        // _assumedContextWindow is resolved per-model by RefreshAssumedContextWindowAsync below.
 
         if (_client is null)
         {
@@ -199,11 +200,15 @@ public partial class MainWindow : Window
                 catch { }
             }
             await PopulateModelsAsync();
+            await RefreshAssumedContextWindowAsync();
+            RefreshStatsDisplay();
             AddSystem("Settings saved.");
         }
         else
         {
             await PopulateModelsAsync();
+            await RefreshAssumedContextWindowAsync();
+            RefreshStatsDisplay();
             AddSystem("Settings saved. Connection/model defaults apply after you Stop and Start again.");
         }
     }
@@ -375,16 +380,17 @@ public partial class MainWindow : Window
             return;
         }
 
-        // Detected model details (family - size - context).
-        var ctx = info.ContextLength >= 1024 ? $"{info.ContextLength / 1024}K ctx"
-                : info.ContextLength > 0 ? $"{info.ContextLength} ctx" : "";
+        // Detected model details (family - size - native context default).
+        var ctx = info.ContextLength >= 1024 ? $"{info.ContextLength / 1024}K native"
+                : info.ContextLength > 0 ? $"{info.ContextLength} native" : "";
         var parts = new[] { info.Family, info.ParameterSize, ctx }
             .Where(p => !string.IsNullOrWhiteSpace(p));
         var label = string.Join(" - ", parts);
         if (!string.IsNullOrWhiteSpace(label))
             CapabilityPanel.Children.Add(MakeCapBadge("\U0001F9E9", label,
                 $"Detected model: family {info.Family}, size {info.ParameterSize}, "
-                + $"context window {info.ContextLength:N0} tokens."));
+                + $"Ollama default context {info.ContextLength:N0} tokens. "
+                + $"Runtime context uses your Settings cap ({_settings.ContextLength:N0})."));
 
         var caps = info.Capabilities;
         if (caps is null || caps.Count == 0) return;
@@ -674,6 +680,7 @@ public partial class MainWindow : Window
             await _client.ConnectAsync();
 
             SetSessionActive(true);
+            RefreshStatsDisplay();   // show configured runtime window before stats arrive
             SetStatus("Ready", AppDot.Idle);
             InputBox.Focus();
             AddSystem($"Connected. Working in {_workingDir}");
@@ -1334,24 +1341,58 @@ public partial class MainWindow : Window
 
     // Best-guess runtime context window for the meter until the server reports real
     // stats. Set from the user's ceiling in the constructor, then per-model on tune.
-    private long _assumedContextWindow = ModelTuning.DefaultContextCap;
+    private long _assumedContextWindow = ModelTuning.FallbackContextLength;
+    private UsageStats? _lastStats;
 
     private void OnStats(UsageStats s)
         => Dispatcher.Invoke(() =>
         {
-            var window = s.ContextWindow > 0 ? s.ContextWindow : _assumedContextWindow;
-            var used = s.PerTurnTokens;
-            var pct = window > 0 ? Math.Clamp(100.0 * used / window, 0, 100) : 0;
-
-            ContextBar.Value = pct;
-            ContextBar.Foreground = pct >= 90 ? (Brush)FindResource("Err")
-                : pct >= 75 ? (Brush)FindResource("Warn")
-                : (Brush)FindResource("Accent");
-            ContextText.Text = $"{Human(used)} / {Human(window)} ({pct:0}%)";
-
-            TokensText.Text = $"Tokens: {Human(s.TotalTokens)}";
-            CostText.Text = s.Cost > 0 ? $"${s.Cost:0.000}" : "";
+            _lastStats = s;
+            RefreshStatsDisplay();
         });
+
+    /// <summary>
+    /// Recompute the meter's fallback window from the selected model and current
+    /// Settings cap. Called after Settings saves so the UI updates immediately,
+    /// without waiting for a new stats event or app restart.
+    /// </summary>
+    private async Task RefreshAssumedContextWindowAsync()
+    {
+        var model = (ModelCombo.SelectedItem as ModelEntry)?.Name ?? _selectedModel;
+        if (_settings.AutoTune && !string.IsNullOrWhiteSpace(model))
+        {
+            // AutoTune resolves auto/cap against the model's native window.
+            var (rec, _) = await RecommendAsync(model);
+            _assumedContextWindow = rec.ContextLength;
+        }
+        else
+        {
+            // AutoTune off: explicit cap if set, otherwise the 32k auto default.
+            _assumedContextWindow = _settings.BackendContextLength;
+        }
+    }
+
+    /// <summary>
+    /// Paint token/context stats. The meter denominator always reflects the
+    /// configured runtime window (_assumedContextWindow), not the server's last
+    /// stats snapshot (which can lag after a Settings change).
+    /// </summary>
+    private void RefreshStatsDisplay()
+    {
+        var stats = _lastStats;
+        var window = _assumedContextWindow;
+        var used = stats?.PerTurnTokens ?? 0;
+        var pct = window > 0 ? Math.Clamp(100.0 * used / window, 0, 100) : 0;
+
+        ContextBar.Value = pct;
+        ContextBar.Foreground = pct >= 90 ? (Brush)FindResource("Err")
+            : pct >= 75 ? (Brush)FindResource("Warn")
+            : (Brush)FindResource("Accent");
+        ContextText.Text = $"{Human(used)} / {Human(window)} ({pct:0}%)";
+
+        TokensText.Text = $"Tokens: {Human(stats?.TotalTokens ?? 0)}";
+        CostText.Text = stats?.Cost > 0 ? $"${stats.Cost:0.000}" : "";
+    }
 
     private void OnCompactingStarted()
         => Dispatcher.Invoke(() =>
@@ -1434,6 +1475,32 @@ public partial class MainWindow : Window
                 LogBox.Text = LogBox.Text[^(MaxLogChars / 2)..];
             LogBox.ScrollToEnd();
         });
+
+    // Height the bottom dock takes when the server log is expanded (remembered so
+    // re-expanding restores whatever the user last dragged it to).
+    private GridLength _logExpandedHeight = new(220);
+
+    /// <summary>Expand the server log: give the bottom dock a resizable height.</summary>
+    private void OnServerLogExpanded(object sender, RoutedEventArgs e)
+    {
+        BottomDockRow.Height = _logExpandedHeight;
+        BottomDockRow.MinHeight = 110;
+        BottomSplitter.Visibility = Visibility.Visible;
+    }
+
+    /// <summary>
+    /// Collapse the server log: shrink the bottom dock to fit just the input row and
+    /// the collapsed log header, so there is no empty gap at the window bottom.
+    /// </summary>
+    private void OnServerLogCollapsed(object sender, RoutedEventArgs e)
+    {
+        // Remember the dragged size so the next expand restores it.
+        if (BottomDockRow.Height.IsAbsolute && BottomDockRow.Height.Value > 0)
+            _logExpandedHeight = BottomDockRow.Height;
+        BottomDockRow.Height = GridLength.Auto;
+        BottomDockRow.MinHeight = 0;
+        BottomSplitter.Visibility = Visibility.Collapsed;
+    }
 
     // ---- status / state -----------------------------------------------------
 
@@ -1537,6 +1604,7 @@ public partial class MainWindow : Window
 
     private void ResetStatsDisplay()
     {
+        _lastStats = null;
         ContextBar.Value = 0;
         ContextText.Text = "-- / --";
         TokensText.Text = "Tokens: 0";

@@ -31,7 +31,7 @@ public sealed class BackendManager : IDisposable
         string host = "127.0.0.1",
         int port = 8000,
         string? executablePath = null,
-        int contextLength = 65536)
+        int contextLength = 32768)
     {
         Host = host;
         Port = port;

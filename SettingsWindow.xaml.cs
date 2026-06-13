@@ -28,7 +28,8 @@ public partial class SettingsWindow : Window
         PortBox.Text = settings.Port.ToString();
         OllamaBox.Text = settings.OllamaUrl;
         ExePathBox.Text = settings.AgentServerPath;
-        ContextLenBox.Text = settings.ContextLength.ToString();
+        // 0 = auto; show it as an empty box.
+        ContextLenBox.Text = settings.ContextLength > 0 ? settings.ContextLength.ToString() : "";
         MaxIterBox.Text = settings.MaxIterations.ToString();
         WorkDirBox.Text = settings.DefaultWorkingDir;
         AutoTuneBox.IsChecked = settings.AutoTune;
@@ -206,8 +207,13 @@ public partial class SettingsWindow : Window
 
         if (!int.TryParse(PortBox.Text, out var port) || port is <= 0 or > 65535)
         { ShowError("Port must be a number between 1 and 65535."); return; }
-        if (!int.TryParse(ContextLenBox.Text, out var ctx) || ctx < 1024)
-        { ShowError("Max context must be a number >= 1024."); return; }
+        // Empty = auto (0). Otherwise it must be a real number >= 1024.
+        int ctx;
+        var ctxText = ContextLenBox.Text.Trim();
+        if (ctxText.Length == 0)
+            ctx = 0;
+        else if (!int.TryParse(ctxText, out ctx) || ctx < 1024)
+        { ShowError("Max context must be a number >= 1024, or blank for auto."); return; }
         if (!int.TryParse(MaxIterBox.Text, out var maxIter) || maxIter < 1)
         { ShowError("Max iterations must be a positive number."); return; }
 

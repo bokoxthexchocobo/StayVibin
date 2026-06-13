@@ -34,7 +34,10 @@
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*" MinHeight="140"/>
             <RowDefinition Height="Auto"/>
-            <RowDefinition Height="200" MinHeight="110"/>
+            <!-- Bottom dock. Auto by default so the collapsed Server log sits flush
+                 with the window bottom (no gap); switched to a resizable height in
+                 code when the log is expanded. -->
+            <RowDefinition x:Name="BottomDockRow" Height="Auto"/>
         </Grid.RowDefinitions>
 
         <!-- Top bar + stats strip -->
@@ -339,11 +342,12 @@
             </Grid>
         </Grid>
 
-        <!-- Draggable divider: resize the bottom dock (input + server log) -->
-        <GridSplitter Grid.Row="2" Height="6" HorizontalAlignment="Stretch"
+        <!-- Draggable divider: resize the bottom dock (input + server log).
+             Only meaningful while the log is expanded, so it is hidden until then. -->
+        <GridSplitter x:Name="BottomSplitter" Grid.Row="2" Height="6" HorizontalAlignment="Stretch"
                       VerticalAlignment="Center" ResizeDirection="Rows"
                       ResizeBehavior="PreviousAndNext" Cursor="SizeNS"
-                      Background="{StaticResource Border}"
+                      Background="{StaticResource Border}" Visibility="Collapsed"
                       ToolTip="Drag to resize the panel below (input + server log)"/>
 
         <!-- Bottom dock: input + server log, resized together by the divider above -->
@@ -417,8 +421,10 @@
                 <ColumnDefinition Width="Auto"/>
             </Grid.ColumnDefinitions>
 
-            <Expander Grid.Column="0" Header="Server log" Foreground="{StaticResource TextDim}"
+            <Expander x:Name="ServerLogExpander" Grid.Column="0" Header="Server log"
+                      Foreground="{StaticResource TextDim}"
                       Background="{StaticResource Panel}" Padding="12,4" IsExpanded="False"
+                      Expanded="OnServerLogExpanded" Collapsed="OnServerLogCollapsed"
                       VerticalAlignment="Stretch" VerticalContentAlignment="Stretch">
                 <ScrollViewer x:Name="LogScroll" VerticalScrollBarVisibility="Auto">
                     <TextBox x:Name="LogBox" IsReadOnly="True" Background="{StaticResource Bg}"

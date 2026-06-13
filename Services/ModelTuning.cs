@@ -7,21 +7,21 @@ public sealed record TuneResult(double Temperature, int ContextLength, string Re
 /// Picks sensible defaults so newbies never have to touch temperature/context.
 /// Coding models run deterministic (temp 0) to stop them rambling; thinking/reasoning
 /// models (DeepSeek-R1, QwQ, Qwen3, Ollama "thinking" capability, etc.) get higher
-/// reasoning effort and a little temperature headroom. Context adapts to the model's
-/// real window, capped at a user-controlled ceiling to stay light on local RAM.
+/// reasoning effort and a little temperature headroom. Runtime context comes from the
+/// user's Settings cap, or "auto" (the model's native window) when the cap is empty.
 /// </summary>
 public static class ModelTuning
 {
-    // Default ceiling when the caller doesn't supply one (matches AppSettings).
-    public const int DefaultContextCap = 65536;
+    // Used for "auto" when no model window is known (matches AppSettings).
+    public const int FallbackContextLength = 32768;
     public const int ContextFloor = 4096;
 
     /// <param name="contextCap">
-    /// Upper bound on the runtime context window (tokens). The chosen context is
-    /// min(model's native window, this cap), so smaller models use less and larger
-    /// models are clamped here. Defaults to <see cref="DefaultContextCap"/>.
+    /// Runtime context window (tokens) from Settings. A positive value is used as-is
+    /// (explicit override). 0 means "auto": use the model's native window, or the 32k
+    /// fallback if Ollama did not report one.
     /// </param>
-    public static TuneResult Recommend(string model, ModelInfo? info, int contextCap = DefaultContextCap)
+    public static TuneResult Recommend(string model, ModelInfo? info, int contextCap = 0)
     {
         var name = (model ?? "").ToLowerInvariant();
 
@@ -33,10 +33,12 @@ public static class ModelTuning
         double temperature = isCoder ? 0.0 : isThinking ? 0.55 : 0.2;
         string reasoning = isThinking ? "high" : "low";
 
-        // Guard against a nonsensical cap, then fit the model's native window into it.
-        int cap = contextCap > 0 ? contextCap : DefaultContextCap;
+        // Explicit cap wins; otherwise "auto" uses the model's native window, falling
+        // back to 32k when Ollama did not report one.
         long native = info?.ContextLength ?? 0;
-        int ctx = native > 0 ? (int)Math.Min(native, cap) : cap;
+        int ctx = contextCap > 0
+            ? contextCap
+            : native > 0 ? (int)native : FallbackContextLength;
         if (ctx < ContextFloor) ctx = ContextFloor;
 
         return new TuneResult(temperature, ctx, reasoning);
