@@ -40,7 +40,14 @@
                         <ComboBox x:Name="ModelCombo" Style="{StaticResource DarkCombo}"
                                   MinWidth="190" VerticalAlignment="Center"
                                   SelectionChanged="OnModelSelected"
-                                  ToolTip="Models detected from your local Ollama"/>
+                                  ItemContainerStyle="{StaticResource ModelComboItem}"
+                                  ToolTip="Models detected from your local Ollama">
+                            <ComboBox.ItemTemplate>
+                                <DataTemplate>
+                                    <TextBlock Text="{Binding Name}"/>
+                                </DataTemplate>
+                            </ComboBox.ItemTemplate>
+                        </ComboBox>
                     </StackPanel>
 
                     <TextBlock x:Name="StatusText" Grid.Column="1" Text="Stopped"

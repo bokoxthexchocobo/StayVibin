@@ -181,6 +181,18 @@
                 </Setter>
             </Style>
 
+            <!-- Model dropdown item: greys out and explains embedding-only models -->
+            <Style x:Key="ModelComboItem" TargetType="ComboBoxItem" BasedOn="{StaticResource DarkComboItem}">
+                <Setter Property="IsEnabled" Value="{Binding IsSelectable}"/>
+                <Setter Property="ToolTip" Value="{Binding Tip}"/>
+                <Setter Property="ToolTipService.ShowOnDisabled" Value="True"/>
+                <Style.Triggers>
+                    <Trigger Property="IsEnabled" Value="False">
+                        <Setter Property="Opacity" Value="0.4"/>
+                    </Trigger>
+                </Style.Triggers>
+            </Style>
+
             <Style x:Key="DarkCombo" TargetType="ComboBox">
                 <Setter Property="Foreground" Value="{StaticResource Text}"/>
                 <Setter Property="Background" Value="{StaticResource PanelAlt}"/>

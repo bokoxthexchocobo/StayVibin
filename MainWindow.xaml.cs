@@ -152,6 +152,7 @@ public partial class MainWindow : Window
     /// <summary>
     /// Fill the model dropdown from Ollama, preserving the currently selected model
     /// even if it isn't installed locally, then refresh its capability strip.
+    /// Embedding-only models are listed but disabled (they can't chat).
     /// </summary>
     private async Task PopulateModelsAsync()
     {
@@ -159,28 +160,57 @@ public partial class MainWindow : Window
             ? Array.Empty<string>()
             : await _ollama.ListModelsAsync();
 
+        // Look up capabilities (cached) so we can grey out embedding-only models.
+        var infos = new Dictionary<string, ModelInfo?>(StringComparer.OrdinalIgnoreCase);
+        if (_ollama is not null && models.Count > 0)
+        {
+            var pairs = await Task.WhenAll(
+                models.Select(async m => (m, info: await _ollama.GetModelInfoAsync(m))));
+            foreach (var (m, info) in pairs) infos[m] = info;
+        }
+
         _populatingModels = true;
         ModelCombo.Items.Clear();
 
-        var list = new List<string>(models);
+        var names = new List<string>(models);
         if (_selectedModel is not null &&
-            !list.Contains(_selectedModel, StringComparer.OrdinalIgnoreCase))
-            list.Insert(0, _selectedModel);
+            !names.Contains(_selectedModel, StringComparer.OrdinalIgnoreCase))
+            names.Insert(0, _selectedModel);
 
-        foreach (var m in list) ModelCombo.Items.Add(m);
+        ModelEntry? toSelect = null;
+        foreach (var name in names)
+        {
+            var entry = new ModelEntry
+            {
+                Name = name,
+                IsEmbedding = IsEmbeddingOnly(infos.GetValueOrDefault(name))
+            };
+            ModelCombo.Items.Add(entry);
+            if (_selectedModel is not null &&
+                name.Equals(_selectedModel, StringComparison.OrdinalIgnoreCase))
+                toSelect = entry;
+        }
 
-        if (_selectedModel is not null)
-            ModelCombo.SelectedItem = list.FirstOrDefault(
-                x => x.Equals(_selectedModel, StringComparison.OrdinalIgnoreCase)) ?? _selectedModel;
-        else if (ModelCombo.Items.Count > 0)
-            ModelCombo.SelectedIndex = 0;
+        // Prefer the configured model; otherwise the first model that can chat.
+        toSelect ??= ModelCombo.Items.Cast<ModelEntry>().FirstOrDefault(e => e.IsSelectable);
+        ModelCombo.SelectedItem = toSelect;
 
         _populatingModels = false;
 
-        if (list.Count == 0)
+        if (names.Count == 0)
             AddSystem("No Ollama models detected - is Ollama running on this machine?");
 
-        _ = UpdateCapabilitiesAsync(_selectedModel ?? ModelCombo.SelectedItem as string);
+        _ = UpdateCapabilitiesAsync((ModelCombo.SelectedItem as ModelEntry)?.Name ?? _selectedModel);
+    }
+
+    /// <summary>True for models that only do embeddings (no chat/completion).</summary>
+    private static bool IsEmbeddingOnly(ModelInfo? info)
+    {
+        var caps = info?.Capabilities;
+        if (caps is null || caps.Count == 0) return false;
+        bool embed = caps.Any(c => c.Equals("embedding", StringComparison.OrdinalIgnoreCase));
+        bool chat = caps.Any(c => c.Equals("completion", StringComparison.OrdinalIgnoreCase));
+        return embed && !chat;
     }
 
     // ---- model capability strip --------------------------------------------
@@ -566,7 +596,8 @@ public partial class MainWindow : Window
     private async void OnModelSelected(object sender, SelectionChangedEventArgs e)
     {
         if (_populatingModels) return;
-        if (ModelCombo.SelectedItem is not string model) return;
+        if (ModelCombo.SelectedItem is not ModelEntry entry || entry.IsEmbedding) return;
+        var model = entry.Name;
         _selectedModel = model;
 
         _ = UpdateCapabilitiesAsync(model);
