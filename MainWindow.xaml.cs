@@ -35,6 +35,7 @@ public partial class MainWindow : Window
     // Messages typed while the agent is busy wait here and are sent one at a time
     // as each agent turn finishes (queueing is the default; Steer interjects now).
     private readonly Queue<QueuedMessage> _queue = new();
+    private readonly SemaphoreSlim _flushLock = new(1, 1);
 
     /// <summary>A user message waiting to be sent after the current turn finishes.</summary>
     private sealed record QueuedMessage(ChatItem Bubble, string Text, List<string> Images);
@@ -98,6 +99,14 @@ public partial class MainWindow : Window
         return b;
     }
 
+    /// <summary>Tear down the old backend (unsubscribe log handler) and spawn a fresh one.</summary>
+    private void RebuildBackend()
+    {
+        _backend.LogLine -= OnBackendLog;
+        try { _backend.Dispose(); } catch { }
+        _backend = BuildBackend();
+    }
+
     private async void OnSettingsClick(object sender, RoutedEventArgs e)
     {
         // Don't let settings (which can dispose/rebuild the backend) run while a
@@ -121,8 +130,7 @@ public partial class MainWindow : Window
         {
             // No active session: rebuild the backend so host/port/path/context apply,
             // and refresh the default working dir.
-            try { _backend.Dispose(); } catch { }
-            _backend = BuildBackend();
+            RebuildBackend();
 
             _workingDir = _settings.EffectiveWorkingDir;
             WorkDirButton.Content = ShortPath(_workingDir);
@@ -170,37 +178,42 @@ public partial class MainWindow : Window
         }
 
         _populatingModels = true;
-        ModelCombo.Items.Clear();
-
-        var names = new List<string>(models);
-        if (_selectedModel is not null &&
-            !names.Contains(_selectedModel, StringComparer.OrdinalIgnoreCase))
-            names.Insert(0, _selectedModel);
-
-        ModelEntry? toSelect = null;
-        foreach (var name in names)
+        try
         {
-            var entry = new ModelEntry
-            {
-                Name = name,
-                IsEmbedding = IsEmbeddingOnly(infos.GetValueOrDefault(name))
-            };
-            ModelCombo.Items.Add(entry);
+            ModelCombo.Items.Clear();
+
+            var names = new List<string>(models);
             if (_selectedModel is not null &&
-                name.Equals(_selectedModel, StringComparison.OrdinalIgnoreCase))
-                toSelect = entry;
+                !names.Contains(_selectedModel, StringComparer.OrdinalIgnoreCase))
+                names.Insert(0, _selectedModel);
+
+            ModelEntry? toSelect = null;
+            foreach (var name in names)
+            {
+                var entry = new ModelEntry
+                {
+                    Name = name,
+                    IsEmbedding = IsEmbeddingOnly(infos.GetValueOrDefault(name))
+                };
+                ModelCombo.Items.Add(entry);
+                if (_selectedModel is not null &&
+                    name.Equals(_selectedModel, StringComparison.OrdinalIgnoreCase))
+                    toSelect = entry;
+            }
+
+            // Prefer the configured model; otherwise the first model that can chat.
+            toSelect ??= ModelCombo.Items.Cast<ModelEntry>().FirstOrDefault(e => e.IsSelectable);
+            ModelCombo.SelectedItem = toSelect;
+
+            if (names.Count == 0)
+                AddSystem("No Ollama models detected - is Ollama running on this machine?");
+
+            _ = UpdateCapabilitiesAsync((ModelCombo.SelectedItem as ModelEntry)?.Name ?? _selectedModel);
         }
-
-        // Prefer the configured model; otherwise the first model that can chat.
-        toSelect ??= ModelCombo.Items.Cast<ModelEntry>().FirstOrDefault(e => e.IsSelectable);
-        ModelCombo.SelectedItem = toSelect;
-
-        _populatingModels = false;
-
-        if (names.Count == 0)
-            AddSystem("No Ollama models detected - is Ollama running on this machine?");
-
-        _ = UpdateCapabilitiesAsync((ModelCombo.SelectedItem as ModelEntry)?.Name ?? _selectedModel);
+        finally
+        {
+            _populatingModels = false;
+        }
     }
 
     /// <summary>True for models that only do embeddings (no chat/completion).</summary>
@@ -447,7 +460,7 @@ public partial class MainWindow : Window
         SetStatus("Starting server...", AppDot.Connecting);
         try
         {
-            JsonNode spec = AgentSpecProvider.Load(_workingDir);
+            JsonNode spec = await AgentSpecProvider.LoadAsync(_workingDir, _editorPath);
             _llmTemplate ??= JsonNode.Parse(spec["llm"]!.ToJsonString());
             if (_selectedModel is not null) ApplyModel(spec, _selectedModel);
 
@@ -460,10 +473,7 @@ public partial class MainWindow : Window
             // for the new value to take effect. We're starting fresh here (_client
             // is null), so disposing any prior server is safe.
             if (_backendContext != _settings.ContextLength)
-            {
-                try { _backend.Dispose(); } catch { }
-                _backend = BuildBackend();
-            }
+                RebuildBackend();
 
             bool healthy = await _backend.StartAsync(TimeSpan.FromSeconds(60));
             if (!healthy)
@@ -612,7 +622,7 @@ public partial class MainWindow : Window
             llm["native_tool_calling"] = false;
             if (_settings.AutoTune)
             {
-                var rec = await RecommendAsync(model);
+                var (rec, _) = await RecommendAsync(model);
                 ApplyTuningToLlm(llm, rec);
                 _assumedContextWindow = rec.ContextLength;
             }
@@ -828,10 +838,10 @@ public partial class MainWindow : Window
     }
 
     /// <summary>Detect the model's metadata and compute recommended settings.</summary>
-    private async Task<TuneResult> RecommendAsync(string model)
+    private async Task<(TuneResult rec, ModelInfo? info)> RecommendAsync(string model)
     {
         ModelInfo? info = _ollama is null ? null : await _ollama.GetModelInfoAsync(model);
-        return ModelTuning.Recommend(model, info);
+        return (ModelTuning.Recommend(model, info), info);
     }
 
     /// <summary>
@@ -843,7 +853,7 @@ public partial class MainWindow : Window
         var model = _selectedModel ?? StripProvider(AgentSpecProvider.DescribeModel(spec));
         if (string.IsNullOrWhiteSpace(model)) return;
 
-        var rec = await RecommendAsync(model);
+        var (rec, info) = await RecommendAsync(model);
         ApplyTuningToLlm(spec["llm"], rec);
         ApplyTuningToLlm(spec["condenser"]?["llm"], rec);
 
@@ -854,7 +864,10 @@ public partial class MainWindow : Window
             _settings.Save();
         }
 
-        AddSystem($"Auto-tuned {model}: temperature {rec.Temperature:0.0}, "
+        var kind = ModelTuning.IsThinkingModel(model, info) ? "thinking"
+            : model.Contains("coder", StringComparison.OrdinalIgnoreCase) ? "coder"
+            : "chat";
+        AddSystem($"Auto-tuned {model} ({kind}): temperature {rec.Temperature:0.0}, "
                   + $"context {rec.ContextLength:N0} tokens, reasoning {rec.ReasoningEffort}.");
     }
 
@@ -865,6 +878,17 @@ public partial class MainWindow : Window
         o["reasoning_effort"] = rec.ReasoningEffort;
         o["max_input_tokens"] = rec.ContextLength;
 
+        // Stream agent replies token-by-token; keep condenser non-streaming.
+        if (o["usage_id"]?.GetValue<string>() == "agent")
+            o["stream"] = true;
+
+        // Local Ollama does not use encrypted-reasoning channels; turning this off
+        // avoids odd behavior on DeepSeek-R1 and similar models.
+        var baseUrl = o["base_url"]?.GetValue<string>() ?? "";
+        if (baseUrl.Contains("localhost", StringComparison.OrdinalIgnoreCase)
+            || baseUrl.Contains("127.0.0.1", StringComparison.OrdinalIgnoreCase))
+            o["enable_encrypted_reasoning"] = false;
+
         // Best-effort hint so native-ollama paths size their context correctly.
         if (o["litellm_extra_body"] is not JsonObject extra)
         {
@@ -872,6 +896,24 @@ public partial class MainWindow : Window
             o["litellm_extra_body"] = extra;
         }
         extra["num_ctx"] = rec.ContextLength;
+    }
+
+    /// <summary>Prefix user messages with editor context (Cursor-style focus hint).</summary>
+    private string PrefixEditorContext(string text)
+    {
+        if (_editorPath is null || !File.Exists(_editorPath)) return text;
+        try
+        {
+            var rel = Path.GetRelativePath(_workingDir, _editorPath);
+            if (rel.StartsWith("..")) rel = _editorPath;
+            rel = rel.Replace('\\', '/');
+            var line = CodeEditor.TextArea.Caret.Line;
+            return $"[Context: user has {rel} open in the editor (line {line})]\n\n{text}";
+        }
+        catch
+        {
+            return text;
+        }
     }
 
     private void OnBodyMouseWheel(object sender, MouseWheelEventArgs e)
@@ -924,7 +966,7 @@ public partial class MainWindow : Window
 
         try
         {
-            await _client.SendUserMessageAsync(payload, images);
+            await _client.SendUserMessageAsync(PrefixEditorContext(payload), images);
         }
         catch (Exception ex)
         {
@@ -951,7 +993,7 @@ public partial class MainWindow : Window
         try
         {
             var (note, images) = await ConsumeAttachmentsAsync();
-            await _client.SendUserMessageAsync(text + note, images);
+            await _client.SendUserMessageAsync(PrefixEditorContext(text + note), images);
         }
         catch (Exception ex)
         {
@@ -967,19 +1009,32 @@ public partial class MainWindow : Window
     {
         if (_client is null || _agentRunning || _queue.Count == 0) return;
 
-        var msg = _queue.Dequeue();
-        UpdateQueueIndicator();
-        msg.Bubble.Header = "You";   // it's no longer waiting
-        _streamingItem = null;
-        SetRunning(true);
+        await _flushLock.WaitAsync();
         try
         {
-            await _client.SendUserMessageAsync(msg.Text, msg.Images);
+            if (_client is null || _agentRunning || _queue.Count == 0) return;
+
+            // Peek first so a failed send does not drop the message from the queue.
+            var msg = _queue.Peek();
+            _streamingItem = null;
+            SetRunning(true);
+            try
+            {
+                await _client.SendUserMessageAsync(PrefixEditorContext(msg.Text), msg.Images);
+                _queue.Dequeue();
+                msg.Bubble.Header = "You";
+                UpdateQueueIndicator();
+            }
+            catch (Exception ex)
+            {
+                AddError($"Failed to send queued message: {ex.Message}");
+                msg.Bubble.Header = "You (queued)";
+                SetRunning(false);
+            }
         }
-        catch (Exception ex)
+        finally
         {
-            AddError($"Failed to send queued message: {ex.Message}");
-            SetRunning(false);
+            _flushLock.Release();
         }
     }
 
@@ -1054,7 +1109,15 @@ public partial class MainWindow : Window
             AddSystem($"Disconnected: {reason}");
             SetRunning(false);
             SetStatus("Disconnected", AppDot.Down);
+            _ = HandleDisconnectAsync();
         });
+
+    /// <summary>WebSocket dropped: tear down the dead client so the UI matches reality.</summary>
+    private async Task HandleDisconnectAsync()
+    {
+        await DisposeClientAsync();
+        SetSessionActive(false);
+    }
 
     private long _assumedContextWindow = ModelTuning.ContextCap;
 
@@ -1091,10 +1154,19 @@ public partial class MainWindow : Window
 
     // ---- chat helpers -------------------------------------------------------
 
+    private const int MaxChatItems = 600;
+
     private ChatItem AddItem(ChatRole role, string header, string text)
     {
         var item = new ChatItem { Role = role, Header = header, Text = text };
         _chat.Add(item);
+        // Trim oldest lines so marathon sessions do not grow the collection without bound.
+        if (_chat.Count > MaxChatItems)
+        {
+            int drop = _chat.Count - MaxChatItems / 2;
+            for (int i = 0; i < drop; i++)
+                _chat.RemoveAt(0);
+        }
         ScrollToBottom();
         return item;
     }
@@ -1200,17 +1272,23 @@ public partial class MainWindow : Window
 
     private List<FileNode> _treeRoots = new();
     private IReadOnlyDictionary<string, char> _statusMap = new Dictionary<string, char>();
+    private int _treeSeq;   // drop stale tree refreshes when folder changes quickly
 
     /// <summary>Rescan the working folder and git status into the explorer tree.</summary>
     private async Task RefreshTreeAsync()
     {
+        var seq = ++_treeSeq;
+
         if (string.IsNullOrWhiteSpace(_workingDir) || !Directory.Exists(_workingDir))
         {
-            FileTree.ItemsSource = null;
+            if (seq == _treeSeq) FileTree.ItemsSource = null;
             return;
         }
 
-        _statusMap = await GitService.GetStatusMapAsync(_workingDir);
+        var map = await GitService.GetStatusMapAsync(_workingDir);
+        if (seq != _treeSeq) return;
+
+        _statusMap = map;
         _treeRoots = WorkspaceExplorer.Load(_workingDir, _statusMap);
         FileTree.ItemsSource = _treeRoots;
 
@@ -1274,10 +1352,16 @@ public partial class MainWindow : Window
             }
 
             _loadingEditor = true;
-            CodeEditor.Text = System.Text.Encoding.UTF8.GetString(bytes);
-            CodeEditor.SyntaxHighlighting =
-                HighlightingManager.Instance.GetDefinitionByExtension(Path.GetExtension(path));
-            _loadingEditor = false;
+            try
+            {
+                CodeEditor.Text = System.Text.Encoding.UTF8.GetString(bytes);
+                CodeEditor.SyntaxHighlighting =
+                    HighlightingManager.Instance.GetDefinitionByExtension(Path.GetExtension(path));
+            }
+            finally
+            {
+                _loadingEditor = false;
+            }
 
             _editorPath = path;
             _editorDiskWrite = info.LastWriteTimeUtc;
@@ -1289,6 +1373,7 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
+            _loadingEditor = false;
             AddError($"Could not open {Path.GetFileName(path)}: {ex.Message}");
         }
     }
@@ -1374,8 +1459,14 @@ public partial class MainWindow : Window
 
             var caret = CodeEditor.CaretOffset;
             _loadingEditor = true;
-            CodeEditor.Text = File.ReadAllText(_editorPath);
-            _loadingEditor = false;
+            try
+            {
+                CodeEditor.Text = File.ReadAllText(_editorPath);
+            }
+            finally
+            {
+                _loadingEditor = false;
+            }
             CodeEditor.CaretOffset = Math.Min(caret, CodeEditor.Document.TextLength);
             _editorDiskWrite = write;
             _editorDirty = false;
@@ -1404,9 +1495,20 @@ public partial class MainWindow : Window
 
     private void Cleanup()
     {
-        try { _client?.Dispose(); } catch { }
+        if (_client is not null)
+        {
+            _client.Update -= OnAgentUpdate;
+            _client.StatusChanged -= OnServerStatus;
+            _client.StatsUpdated -= OnStats;
+            _client.Compacted -= OnCompacted;
+            _client.Disconnected -= OnDisconnected;
+            try { _client.Dispose(); } catch { }
+            _client = null;
+        }
+        _backend.LogLine -= OnBackendLog;
         try { _backend.Dispose(); } catch { }
         try { _ollama?.Dispose(); } catch { }
+        try { _flushLock.Dispose(); } catch { }
     }
 
     // ---- misc ---------------------------------------------------------------

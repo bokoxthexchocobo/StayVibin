@@ -58,8 +58,9 @@ public static class AgentSpecProvider
         + "only they can make.\n"
         + "\n"
         + "Git and GitHub - you can use them directly via your terminal:\n"
-        + "- 'git' and the GitHub CLI 'gh' are installed and gh is already "
-        + "authenticated. Use them yourself; do not tell the user to run git commands.\n"
+        + "- 'git' and the GitHub CLI 'gh' may be on PATH. Run 'git status' and "
+        + "'gh auth status' yourself to see what is available; do not assume GitHub "
+        + "access until gh reports a signed-in account.\n"
         + "- Run git from the working directory. Inspect with 'git status', "
         + "'git log --oneline -n 20', 'git diff'. Stage and commit your work with clear, "
         + "concise messages (use a HEREDOC or a single -m). Create feature branches "
@@ -77,7 +78,27 @@ public static class AgentSpecProvider
         + "user's uncommitted work without being asked, never commit secrets (.env, keys, "
         + "tokens), and never run 'gh auth login'/'gh auth logout' (that is the user's). "
         + "If a git/gh action genuinely needs interactive auth or a destructive "
-        + "force-push, stop and ask the user.";
+        + "force-push, stop and ask the user."
+        + "\n\n"
+        + "Accuracy - the codebase is ground truth (Cursor/IDE rules):\n"
+        + "- NEVER describe, quote, compare, or edit code you have not read with your "
+        + "file tools in this session. Search or open the file first.\n"
+        + "- Before answering a factual question about the code, locate the relevant "
+        + "symbols with 'rg \"pattern\" .' or by reading the named file, then answer "
+        + "from what you actually read.\n"
+        + "- When you state a fact about the code, cite evidence: path:line or a short "
+        + "quote copied from the file you read. No hypothetical snippets.\n"
+        + "- If you searched and did not find something, say exactly what you searched "
+        + "and where - do not guess that it 'might' exist elsewhere.\n"
+        + "- Before editing, read the target file (or the relevant section). Prefer "
+        + "small, precise edits over rewriting whole files.\n"
+        + "- Do not infer behavior from filenames, folder names, or naming similarity "
+        + "alone - read the implementation.\n"
+        + "- After non-trivial edits, verify with 'git diff' or re-read the changed "
+        + "lines when feasible.\n"
+        + "- StayVibin may tell you which file the user has open in the editor; treat "
+        + "that as a hint for what they care about, but still read the file before "
+        + "claiming what is in it.";
 
     public static string DefaultSettingsPath()
     {
@@ -93,7 +114,7 @@ public static class AgentSpecProvider
     /// agentic anti-refusal system suffix. Pass the working directory so the
     /// agent is told where it is operating.
     /// </summary>
-    public static JsonNode Load(string? workingDir = null, string? path = null)
+    public static JsonNode Load(string? workingDir = null, string? workspaceSnapshot = null, string? path = null)
     {
         path ??= DefaultSettingsPath();
         if (!File.Exists(path))
@@ -107,8 +128,34 @@ public static class AgentSpecProvider
 
         ForceNonNative(node["llm"]);
         ForceNonNative(node["condenser"]?["llm"]);
-        InjectAgentContext(node, workingDir);
+        ApplyAccuracySettings(node);
+        InjectAgentContext(node, workingDir, workspaceSnapshot);
         return node;
+    }
+
+    /// <summary>Same as <see cref="Load"/> but builds the workspace snapshot first.</summary>
+    public static async Task<JsonNode> LoadAsync(
+        string? workingDir = null, string? editorPath = null, string? path = null)
+    {
+        var snapshot = workingDir is null
+            ? ""
+            : await WorkspaceContextService.BuildAsync(workingDir, editorPath);
+        return Load(workingDir, string.IsNullOrWhiteSpace(snapshot) ? null : snapshot, path);
+    }
+
+    /// <summary>
+    /// Loosen condensation slightly so long investigations retain more early context
+    /// (helps local models stay accurate on multi-step tasks).
+    /// </summary>
+    public static void ApplyAccuracySettings(JsonNode node)
+    {
+        if (node["condenser"] is not JsonObject cond) return;
+
+        var keep = cond["keep_first"]?.GetValue<int>() ?? 2;
+        if (keep < 4) cond["keep_first"] = 4;
+
+        var max = cond["max_size"]?.GetValue<int>() ?? 240;
+        if (max < 280) cond["max_size"] = 280;
     }
 
     public static string DescribeModel(JsonNode spec)
@@ -140,17 +187,20 @@ public static class AgentSpecProvider
             obj["native_tool_calling"] = false;
     }
 
-    private static void InjectAgentContext(JsonNode node, string? workingDir)
+    private static void InjectAgentContext(JsonNode node, string? workingDir, string? workspaceSnapshot)
     {
         if (node is not JsonObject obj) return;
 
-        var suffix = AgenticSuffix;
+        var parts = new List<string>();
+        if (!string.IsNullOrWhiteSpace(workspaceSnapshot))
+            parts.Add(workspaceSnapshot.Trim());
         if (!string.IsNullOrWhiteSpace(workingDir))
-            suffix = $"Your current working directory is: {workingDir}\n\n{suffix}";
+            parts.Add($"Your current working directory is: {workingDir}");
+        parts.Add(AgenticSuffix);
 
         obj["agent_context"] = new JsonObject
         {
-            ["system_message_suffix"] = suffix,
+            ["system_message_suffix"] = string.Join("\n\n", parts),
             // Keep startup fast and offline-safe for the desktop app.
             ["load_user_skills"] = false,
             ["load_public_skills"] = false

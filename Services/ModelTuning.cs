@@ -5,9 +5,10 @@ public sealed record TuneResult(double Temperature, int ContextLength, string Re
 
 /// <summary>
 /// Picks sensible defaults so newbies never have to touch temperature/context.
-/// Coding models run deterministic (temp 0) to stop them rambling and lecturing;
-/// reasoning models get a little creativity and full reasoning effort. Context
-/// is taken from the model's real window, capped to stay light on local RAM.
+/// Coding models run deterministic (temp 0) to stop them rambling; thinking/reasoning
+/// models (DeepSeek-R1, QwQ, Qwen3, Ollama "thinking" capability, etc.) get higher
+/// reasoning effort and a little temperature headroom. Context is taken from the
+/// model's real window, capped to stay light on local RAM.
 /// </summary>
 public static class ModelTuning
 {
@@ -19,20 +20,12 @@ public static class ModelTuning
     {
         var name = (model ?? "").ToLowerInvariant();
 
-        bool isCoder =
-            name.Contains("coder") || name.Contains("code") ||
-            name.Contains("starcoder") || name.Contains("codestral") ||
-            name.Contains("codellama") || name.Contains("deepseek-coder");
+        bool isCoder = IsCodingModel(name);
+        // Capability-first: any model Ollama marks as "thinking" gets reasoning tuning,
+        // regardless of vendor (DeepSeek, Qwen, Phi, future releases).
+        bool isThinking = !isCoder && IsThinkingModel(name, info);
 
-        bool capThinking = info?.Capabilities is { } caps &&
-            caps.Any(c => c.Equals("thinking", StringComparison.OrdinalIgnoreCase));
-
-        bool isThinking = capThinking ||
-            name.Contains("r1") || name.Contains("qwq") || name.Contains("magistral") ||
-            name.Contains("thinking") || name.Contains("gpt-oss") ||
-            name.StartsWith("qwen3") || name.StartsWith("qwen/qwen3");
-
-        double temperature = isCoder ? 0.0 : (isThinking ? 0.6 : 0.2);
+        double temperature = isCoder ? 0.0 : isThinking ? 0.55 : 0.2;
         string reasoning = isThinking ? "high" : "low";
 
         long native = info?.ContextLength ?? 0;
@@ -40,5 +33,33 @@ public static class ModelTuning
         if (ctx < ContextFloor) ctx = ContextFloor;
 
         return new TuneResult(temperature, ctx, reasoning);
+    }
+
+    /// <summary>True for instruct/coder variants that should stay deterministic.</summary>
+    private static bool IsCodingModel(string name)
+        => name.Contains("coder") || name.Contains("codestral")
+           || name.Contains("starcoder") || name.Contains("codellama")
+           || name.Contains("deepseek-coder") || name.Contains("codegemma")
+           || name.Contains("granite-code") || name.Contains("codeqwen");
+
+    /// <summary>
+    /// True for chain-of-thought / reasoning models. Prefers Ollama's capability
+    /// flag; falls back to well-known name patterns when metadata is missing.
+    /// </summary>
+    public static bool IsThinkingModel(string name, ModelInfo? info)
+    {
+        if (info?.Capabilities is { } caps &&
+            caps.Any(c => c.Equals("thinking", StringComparison.OrdinalIgnoreCase)))
+            return true;
+
+        // Name heuristics when /api/show does not report capabilities yet.
+        return name.Contains("-r1") || name.Contains("/r1")
+               || name.Contains("deepseek-r1") || name.Contains("deepseek-reasoner")
+               || name.Contains("qwq") || name.Contains("magistral")
+               || name.Contains("reasoning") || name.Contains("think")
+               || name.Contains("gpt-oss")
+               || name.StartsWith("qwen3") || name.StartsWith("qwen/qwen3")
+               || name.Contains("o1") || name.Contains("o3")
+               || name.Contains("phi4-reasoning");
     }
 }

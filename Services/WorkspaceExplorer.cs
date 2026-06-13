@@ -11,7 +11,8 @@ namespace StayVibin.Services;
 /// </summary>
 public static class WorkspaceExplorer
 {
-    private static readonly HashSet<string> Ignored = new(StringComparer.OrdinalIgnoreCase)
+    /// <summary>Directory names skipped in the explorer and workspace snapshot.</summary>
+    public static readonly HashSet<string> Ignored = new(StringComparer.OrdinalIgnoreCase)
     {
         ".git", "node_modules", "bin", "obj", ".vs", ".idea", "dist", "build",
         "__pycache__", ".venv", "venv", "packages", "target", ".next", ".nuget",
