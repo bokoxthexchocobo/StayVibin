@@ -9,6 +9,26 @@
         WindowStartupLocation="CenterScreen"
         FontFamily="Segoe UI" FontSize="14">
 
+    <Window.Resources>
+        <!-- Pulses the status dot while the agent is working (secondary activity cue). -->
+        <Storyboard x:Key="DotPulseSb" RepeatBehavior="Forever" AutoReverse="True">
+            <DoubleAnimation Storyboard.TargetName="StatusDot"
+                             Storyboard.TargetProperty="Opacity"
+                             From="1.0" To="0.25" Duration="0:0:0.7"/>
+        </Storyboard>
+
+        <!--
+          Indeterminate "agent working" bar: a single bright accent stop travels
+          left to right; the fixed transparent ends give it a soft moving glow.
+          Started/stopped from code (SetActivity) so it only runs while working.
+        -->
+        <Storyboard x:Key="ActivitySlideSb" RepeatBehavior="Forever">
+            <DoubleAnimation Storyboard.TargetName="ActivityStopMid"
+                             Storyboard.TargetProperty="Offset"
+                             From="0.0" To="1.0" Duration="0:0:1.1"/>
+        </Storyboard>
+    </Window.Resources>
+
     <Grid Margin="0">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
@@ -48,6 +68,11 @@
                                 </DataTemplate>
                             </ComboBox.ItemTemplate>
                         </ComboBox>
+                        <Button x:Name="RefreshModelsButton" Content="&#x21BB;"
+                                Style="{StaticResource FlatButton}" Padding="9,3" FontSize="14"
+                                Margin="6,0,0,0" VerticalAlignment="Center"
+                                Click="OnRefreshModels"
+                                ToolTip="Re-scan Ollama for installed models"/>
                     </StackPanel>
 
                     <TextBlock x:Name="StatusText" Grid.Column="1" Text="Stopped"
@@ -111,6 +136,20 @@
                                 ToolTip="Summarize the conversation history now to free up context"/>
                     </StackPanel>
                 </Grid>
+            </Border>
+
+            <!-- Indeterminate activity line: animates only while the agent works -->
+            <Border x:Name="ActivityBar" Height="3" Background="{StaticResource Bg}"
+                    ClipToBounds="True" Visibility="Collapsed">
+                <Rectangle>
+                    <Rectangle.Fill>
+                        <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+                            <GradientStop Color="#005B8CFF" Offset="0"/>
+                            <GradientStop x:Name="ActivityStopMid" Color="#FF5B8CFF" Offset="0"/>
+                            <GradientStop Color="#005B8CFF" Offset="1"/>
+                        </LinearGradientBrush>
+                    </Rectangle.Fill>
+                </Rectangle>
             </Border>
         </StackPanel>
 

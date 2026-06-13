@@ -6,6 +6,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Media.Animation;
 using System.Windows.Media.Imaging;
 using ICSharpCode.AvalonEdit.Highlighting;
 using Microsoft.Win32;
@@ -31,6 +32,8 @@ public partial class MainWindow : Window
     private bool _busy;             // a Start/Send operation is in flight
     private bool _agentRunning;     // the agent loop is actively running
     private ChatItem? _streamingItem;
+    private readonly System.Text.StringBuilder _streamRaw = new();   // raw stream before tool-syntax stripping
+    private bool _streamStripMode;  // once tool markup is seen, re-strip the whole stream each delta
 
     // Messages typed while the agent is busy wait here and are sent one at a time
     // as each agent turn finishes (queueing is the default; Steer interjects now).
@@ -44,6 +47,7 @@ public partial class MainWindow : Window
     private JsonNode? _llmTemplate;     // detached clone of the configured LLM (for switches)
     private string? _selectedModel;     // ollama tag, e.g. "qwen2.5-coder:14b"
     private bool _populatingModels;
+    private readonly SemaphoreSlim _modelLoadLock = new(1, 1);   // serialize PopulateModelsAsync
 
     public MainWindow()
     {
@@ -66,6 +70,7 @@ public partial class MainWindow : Window
             catch { /* model picker still works once configured */ }
         }
         _ollama = new OllamaClient(_settings.OllamaUrl);
+        _assumedContextWindow = _settings.ContextLength;   // refined per-model on tune
 
         AddSystem("Welcome. Pick a working folder, then press Start to launch the agent.");
         Closing += (_, _) => Cleanup();
@@ -81,10 +86,55 @@ public partial class MainWindow : Window
         _ = RefreshTreeAsync();
     }
 
-    private void OnWindowLoaded(object sender, RoutedEventArgs e)
+    private async void OnWindowLoaded(object sender, RoutedEventArgs e)
     {
         Loaded -= OnWindowLoaded;   // run once
         PromptInstallGitIfMissing();
+
+        // First run: no model configured yet - walk the user through provider setup
+        // so they never have to hand-write agent_settings.json.
+        if (!AgentSpecProvider.SettingsExist)
+            await EnsureProviderConfiguredAsync();
+    }
+
+    /// <summary>
+    /// Ensure a model/provider is configured (agent_settings.json exists), showing
+    /// the first-run provider dialog and writing a default config when it isn't.
+    /// Returns false if the user dismissed setup without configuring.
+    /// </summary>
+    private async Task<bool> EnsureProviderConfiguredAsync()
+    {
+        if (AgentSpecProvider.SettingsExist) return true;
+
+        var dlg = new ProviderSetupWindow(_settings) { Owner = this };
+        if (dlg.ShowDialog() != true)
+        {
+            AddSystem("No AI provider configured yet. Press Start (or open Settings) to set one up.");
+            return false;
+        }
+
+        // Keep the app's Ollama URL in sync with what the user entered.
+        _settings.OllamaUrl = dlg.OllamaUrl;
+        _settings.Save();
+        _ollama?.Dispose();
+        _ollama = new OllamaClient(_settings.OllamaUrl);
+
+        try
+        {
+            AgentSpecProvider.CreateDefault(dlg.Model, dlg.OllamaUrl);
+            var spec = AgentSpecProvider.Load();
+            _llmTemplate = JsonNode.Parse(spec["llm"]!.ToJsonString());
+            _selectedModel = StripProvider(AgentSpecProvider.DescribeModel(spec));
+        }
+        catch (Exception ex)
+        {
+            AddError($"Could not write the provider config: {ex.Message}");
+            return false;
+        }
+
+        await PopulateModelsAsync();
+        AddSystem($"Configured Ollama with model {dlg.Model}. Press Start to begin.");
+        return true;
     }
 
     private int _backendContext;
@@ -125,6 +175,7 @@ public partial class MainWindow : Window
 
         _ollama?.Dispose();
         _ollama = new OllamaClient(_settings.OllamaUrl);
+        _assumedContextWindow = _settings.ContextLength;   // ceiling may have changed
 
         if (_client is null)
         {
@@ -164,16 +215,35 @@ public partial class MainWindow : Window
     /// </summary>
     private async Task PopulateModelsAsync()
     {
-        var models = _ollama is null
+        // Serialize so overlapping callers (startup + first-run, rapid Refresh, or a
+        // settings save) can't interleave their dropdown updates or clear the
+        // _populatingModels guard out from under each other.
+        await _modelLoadLock.WaitAsync();
+        try
+        {
+            await PopulateModelsCoreAsync();
+        }
+        finally
+        {
+            _modelLoadLock.Release();
+        }
+    }
+
+    private async Task PopulateModelsCoreAsync()
+    {
+        // Capture once so a concurrent settings change (which disposes/recreates
+        // _ollama) can't swap the client mid-scan.
+        var ollama = _ollama;
+        var models = ollama is null
             ? Array.Empty<string>()
-            : await _ollama.ListModelsAsync();
+            : await ollama.ListModelsAsync();
 
         // Look up capabilities (cached) so we can grey out embedding-only models.
         var infos = new Dictionary<string, ModelInfo?>(StringComparer.OrdinalIgnoreCase);
-        if (_ollama is not null && models.Count > 0)
+        if (ollama is not null && models.Count > 0)
         {
             var pairs = await Task.WhenAll(
-                models.Select(async m => (m, info: await _ollama.GetModelInfoAsync(m))));
+                models.Select(async m => (m, info: await ollama.GetModelInfoAsync(m))));
             foreach (var (m, info) in pairs) infos[m] = info;
         }
 
@@ -213,6 +283,28 @@ public partial class MainWindow : Window
         finally
         {
             _populatingModels = false;
+        }
+    }
+
+    /// <summary>
+    /// Re-scan Ollama for installed models so a newly pulled model shows up without
+    /// restarting the app. The model list itself is never cached, so a refresh picks
+    /// up additions immediately.
+    /// </summary>
+    private async void OnRefreshModels(object sender, RoutedEventArgs e)
+    {
+        if (_ollama is null) return;
+        RefreshModelsButton.IsEnabled = false;
+        try
+        {
+            // Drop cached metadata so capabilities/context re-fetch for every model
+            // (covers transient failures and re-pulled/retagged models).
+            _ollama.ClearCache();
+            await PopulateModelsAsync();
+        }
+        finally
+        {
+            RefreshModelsButton.IsEnabled = true;
         }
     }
 
@@ -441,6 +533,75 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
+    /// Make sure agent-server.exe exists, offering a one-click automatic install
+    /// (via uv) when it doesn't. Returns true when the backend is ready to launch.
+    /// </summary>
+    private async Task<bool> EnsureBackendInstalledAsync()
+    {
+        if (_backend.ExecutableExists) return true;
+
+        // If the user pointed us at an explicit path, don't try to install over it -
+        // just tell them it's wrong so they can fix the path or clear it.
+        if (!string.IsNullOrWhiteSpace(_settings.AgentServerPath))
+        {
+            AddError("agent-server.exe was not found at your configured path:\n"
+                     + $"{_settings.EffectiveAgentServerPath}\n"
+                     + "Fix or clear the path in Settings (clearing it lets StayVibin "
+                     + "install OpenHands automatically).");
+            return false;
+        }
+
+        var choice = MessageBox.Show(
+            this,
+            "The OpenHands agent-server isn't installed yet.\n\n"
+            + "StayVibin can set it up for you automatically (it installs uv if needed, "
+            + "then runs 'uv tool install openhands'). This downloads OpenHands, needs "
+            + "an internet connection, and can take a few minutes.\n\nInstall it now?",
+            "Set up OpenHands?",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Question);
+        if (choice != MessageBoxResult.Yes)
+        {
+            AddSystem("OpenHands is not installed. You can install it later by pressing "
+                      + "Start again, or manually with 'uv tool install openhands'.");
+            return false;
+        }
+
+        SetStatus("Installing OpenHands...", AppDot.Connecting);
+        SetActivity(true);   // show the activity bar during the long install
+        AddSystem("Setting up OpenHands agent-server (one-time install)...");
+
+        var installer = new OpenHandsInstaller();
+        installer.LogLine += OnBackendLog;   // mirror install output into the server log
+        try
+        {
+            bool ok = await installer.EnsureInstalledAsync();
+            if (!ok)
+            {
+                AddError("Automatic OpenHands setup failed - see the Server log for details. "
+                         + "You can also install it manually: uv tool install openhands");
+                return false;
+            }
+
+            RebuildBackend();   // rebind to the freshly installed agent-server.exe
+            if (!_backend.ExecutableExists)
+            {
+                AddError("OpenHands installed but agent-server.exe still wasn't found at "
+                         + $"{_backend.ExecutablePath}. Set the path in Settings.");
+                return false;
+            }
+
+            AddSystem("OpenHands installed successfully.");
+            return true;
+        }
+        finally
+        {
+            installer.LogLine -= OnBackendLog;
+            SetActivity(false);
+        }
+    }
+
+    /// <summary>
     /// Top-right button handler. Acts as Start when idle (launch server, create
     /// conversation, connect the event socket) and Stop when a session is live.
     /// </summary>
@@ -460,6 +621,22 @@ public partial class MainWindow : Window
         SetStatus("Starting server...", AppDot.Connecting);
         try
         {
+            // First run convenience: configure a provider/model, then install the
+            // agent-server automatically (via uv) - no terminal needed.
+            if (!await EnsureProviderConfiguredAsync())
+            {
+                SetStatus("Not configured", AppDot.Down);
+                SetSessionActive(false);
+                return;
+            }
+
+            if (!await EnsureBackendInstalledAsync())
+            {
+                SetStatus("OpenHands not installed", AppDot.Down);
+                SetSessionActive(false);
+                return;
+            }
+
             JsonNode spec = await AgentSpecProvider.LoadAsync(_workingDir, _editorPath);
             _llmTemplate ??= JsonNode.Parse(spec["llm"]!.ToJsonString());
             if (_selectedModel is not null) ApplyModel(spec, _selectedModel);
@@ -489,6 +666,7 @@ public partial class MainWindow : Window
             _client.Update += OnAgentUpdate;
             _client.StatusChanged += OnServerStatus;
             _client.StatsUpdated += OnStats;
+            _client.CompactingStarted += OnCompactingStarted;
             _client.Compacted += OnCompacted;
             _client.Disconnected += OnDisconnected;
 
@@ -499,6 +677,7 @@ public partial class MainWindow : Window
             SetStatus("Ready", AppDot.Idle);
             InputBox.Focus();
             AddSystem($"Connected. Working in {_workingDir}");
+            AddSystem(DescribeAutoCompact(spec));
             await ReportGitToolingAsync();
             await UpdateRepoBadgeAsync();
         }
@@ -591,6 +770,7 @@ public partial class MainWindow : Window
         try
         {
             AddSystem("Compacting conversation history...");
+            SetCompactStatus("Compacting...", AppDot.Connecting);
             await _client.CondenseAsync();
         }
         catch (Exception ex)
@@ -841,7 +1021,8 @@ public partial class MainWindow : Window
     private async Task<(TuneResult rec, ModelInfo? info)> RecommendAsync(string model)
     {
         ModelInfo? info = _ollama is null ? null : await _ollama.GetModelInfoAsync(model);
-        return (ModelTuning.Recommend(model, info), info);
+        // ContextLength is the user-set ceiling; AutoTune fits each model under it.
+        return (ModelTuning.Recommend(model, info, _settings.ContextLength), info);
     }
 
     /// <summary>
@@ -857,12 +1038,9 @@ public partial class MainWindow : Window
         ApplyTuningToLlm(spec["llm"], rec);
         ApplyTuningToLlm(spec["condenser"]?["llm"], rec);
 
+        // The runtime window is what the meter should track. We do NOT overwrite
+        // _settings.ContextLength here - that is the user's ceiling, not the result.
         _assumedContextWindow = rec.ContextLength;
-        if (_settings.ContextLength != rec.ContextLength)
-        {
-            _settings.ContextLength = rec.ContextLength;
-            _settings.Save();
-        }
 
         var kind = ModelTuning.IsThinkingModel(model, info) ? "thinking"
             : model.Contains("coder", StringComparison.OrdinalIgnoreCase) ? "coder"
@@ -1046,6 +1224,21 @@ public partial class MainWindow : Window
         QueueText.Visibility = n == 0 ? Visibility.Collapsed : Visibility.Visible;
     }
 
+    /// <summary>
+    /// Check just the freshly appended tail of the stream for the start of a leaked
+    /// tool-call marker. The overlap (longest marker is "&lt;parameter=" at 11 chars)
+    /// ensures a marker split across two deltas is still detected.
+    /// </summary>
+    private bool TailHasToolMarker(int newChars)
+    {
+        const int overlap = 12;
+        int len = _streamRaw.Length;
+        int from = Math.Max(0, len - newChars - overlap);
+        var tail = _streamRaw.ToString(from, len - from);
+        return tail.IndexOf("<function=", StringComparison.OrdinalIgnoreCase) >= 0
+            || tail.IndexOf("<parameter=", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
     private void OnAgentUpdate(AgentUpdate u)
         => Dispatcher.Invoke(() => ApplyUpdate(u));
 
@@ -1053,8 +1246,28 @@ public partial class MainWindow : Window
     {
         if (u.Role == ChatRole.Agent && u.IsDelta)
         {
-            _streamingItem ??= AddItem(ChatRole.Agent, u.Header, "");
-            _streamingItem.Append(u.Text);
+            if (_streamingItem is null)
+            {
+                _streamingItem = AddItem(ChatRole.Agent, u.Header, "");
+                _streamRaw.Clear();
+                _streamStripMode = false;
+            }
+            _streamRaw.Append(u.Text);
+
+            // Fast path: until tool markup actually appears, append incrementally
+            // (cheap). Only a misbehaving model leaks <function=.../<parameter=...,
+            // and once it does we switch to re-stripping the whole stream each delta
+            // so the markup never shows. We scan only the tail (new chunk plus a
+            // small overlap) so detection stays O(1) per delta and still catches a
+            // marker split across two deltas.
+            if (!_streamStripMode && TailHasToolMarker(u.Text.Length))
+                _streamStripMode = true;
+
+            if (_streamStripMode)
+                _streamingItem.Text = ChatText.Strip(_streamRaw.ToString());
+            else
+                _streamingItem.Append(u.Text);
+
             ScrollToBottom();
             return;
         }
@@ -1119,7 +1332,9 @@ public partial class MainWindow : Window
         SetSessionActive(false);
     }
 
-    private long _assumedContextWindow = ModelTuning.ContextCap;
+    // Best-guess runtime context window for the meter until the server reports real
+    // stats. Set from the user's ceiling in the constructor, then per-model on tune.
+    private long _assumedContextWindow = ModelTuning.DefaultContextCap;
 
     private void OnStats(UsageStats s)
         => Dispatcher.Invoke(() =>
@@ -1138,18 +1353,48 @@ public partial class MainWindow : Window
             CostText.Text = s.Cost > 0 ? $"${s.Cost:0.000}" : "";
         });
 
+    private void OnCompactingStarted()
+        => Dispatcher.Invoke(() =>
+        {
+            AddSystem("Auto-compacting conversation history...");
+            SetCompactStatus("Compacting...", AppDot.Working);
+        });
+
     private void OnCompacted()
         => Dispatcher.Invoke(() =>
         {
             AddSystem("Context auto-compacted (history summarized to free up space).");
-            CompactText.Text = "Compacted";
+            SetCompactStatus("Compacted", AppDot.Idle);
             _ = ResetCompactLabelAsync();
         });
+
+    /// <summary>Human-readable auto-compact status for the chat log at session start.</summary>
+    private static string DescribeAutoCompact(JsonNode spec)
+    {
+        if (spec["condenser"] is not JsonObject cond)
+            return "Auto-compact is off (no condenser configured in agent settings).";
+
+        var max = cond["max_size"]?.GetValue<int>() ?? 280;
+        return $"Auto-compact is on - conversation history will be summarized automatically "
+               + $"when it grows past about {max} events. Use Compact now to summarize early.";
+    }
+
+    private void SetCompactStatus(string label, AppDot dot)
+    {
+        CompactText.Text = label;
+        CompactText.Foreground = dot switch
+        {
+            AppDot.Working => (Brush)FindResource("Warn"),
+            AppDot.Idle => (Brush)FindResource("Ok"),
+            _ => (Brush)FindResource("TextDim")
+        };
+    }
 
     private async Task ResetCompactLabelAsync()
     {
         await Task.Delay(2500);
-        if (_client is not null) CompactText.Text = "Auto-compact: on";
+        if (_client is not null)
+            SetCompactStatus("Auto-compact: on", AppDot.Idle);
     }
 
     // ---- chat helpers -------------------------------------------------------
@@ -1242,6 +1487,7 @@ public partial class MainWindow : Window
             _queue.Clear();
             UpdateQueueIndicator();
             _agentRunning = false;
+            SetActivity(false);
             ResetStatsDisplay();
         }
     }
@@ -1257,6 +1503,36 @@ public partial class MainWindow : Window
         SendButton.IsEnabled = session;
         SendButton.Content = running ? "Queue" : "Send";
         InputBox.IsEnabled = session;
+        SetActivity(running);
+    }
+
+    private bool _activityOn;
+
+    /// <summary>
+    /// Show/animate the "agent working" cues: the sliding accent line under the
+    /// header and the pulsing status dot. Guarded so repeated status ticks don't
+    /// restart the animations.
+    /// </summary>
+    private void SetActivity(bool on)
+    {
+        if (on == _activityOn) return;
+        _activityOn = on;
+
+        var slide = (Storyboard)Resources["ActivitySlideSb"];
+        var pulse = (Storyboard)Resources["DotPulseSb"];
+        if (on)
+        {
+            ActivityBar.Visibility = Visibility.Visible;
+            slide.Begin(this, true);
+            pulse.Begin(this, true);
+        }
+        else
+        {
+            slide.Stop(this);
+            pulse.Stop(this);
+            ActivityBar.Visibility = Visibility.Collapsed;
+            StatusDot.Opacity = 1.0;   // restore after the pulse leaves it dimmed
+        }
     }
 
     private void ResetStatsDisplay()
@@ -1266,6 +1542,7 @@ public partial class MainWindow : Window
         TokensText.Text = "Tokens: 0";
         CostText.Text = "";
         CompactText.Text = "Auto-compact: on";
+        CompactText.Foreground = (Brush)FindResource("Ok");
     }
 
     // ---- file explorer ------------------------------------------------------
@@ -1480,17 +1757,20 @@ public partial class MainWindow : Window
 
     private async Task DisposeClientAsync()
     {
-        if (_client is not null)
-        {
-            _client.Update -= OnAgentUpdate;
-            _client.StatusChanged -= OnServerStatus;
-            _client.StatsUpdated -= OnStats;
-            _client.Compacted -= OnCompacted;
-            _client.Disconnected -= OnDisconnected;
-            _client.Dispose();
-            _client = null;
-        }
-        await Task.CompletedTask;
+        if (_client is null) return;
+
+        var client = _client;
+        _client = null;   // detach first so nothing else uses it during teardown
+        client.Update -= OnAgentUpdate;
+        client.StatusChanged -= OnServerStatus;
+        client.StatsUpdated -= OnStats;
+        client.CompactingStarted -= OnCompactingStarted;
+        client.Compacted -= OnCompacted;
+        client.Disconnected -= OnDisconnected;
+
+        // Dispose blocks up to ~1s closing the WebSocket; run it off the UI thread
+        // so the app stays responsive while a session is torn down.
+        await Task.Run(() => { try { client.Dispose(); } catch { } });
     }
 
     private void Cleanup()
@@ -1500,6 +1780,7 @@ public partial class MainWindow : Window
             _client.Update -= OnAgentUpdate;
             _client.StatusChanged -= OnServerStatus;
             _client.StatsUpdated -= OnStats;
+            _client.CompactingStarted -= OnCompactingStarted;
             _client.Compacted -= OnCompacted;
             _client.Disconnected -= OnDisconnected;
             try { _client.Dispose(); } catch { }
@@ -1509,6 +1790,7 @@ public partial class MainWindow : Window
         try { _backend.Dispose(); } catch { }
         try { _ollama?.Dispose(); } catch { }
         try { _flushLock.Dispose(); } catch { }
+        try { _modelLoadLock.Dispose(); } catch { }
     }
 
     // ---- misc ---------------------------------------------------------------

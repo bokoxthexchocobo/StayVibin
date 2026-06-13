@@ -36,6 +36,7 @@ public sealed class AgentServerClient : IDisposable
     public event Action<AgentUpdate>? Update;
     public event Action<string>? StatusChanged;
     public event Action<UsageStats>? StatsUpdated;
+    public event Action? CompactingStarted;
     public event Action? Compacted;
     public event Action<string>? Disconnected;
 
@@ -225,6 +226,8 @@ public sealed class AgentServerClient : IDisposable
                     var (role, text) = ReadMessage(root);
                     // Skip echoes of the user's own message (we render those locally).
                     if (role == "user") return;
+                    // Strip any leaked tool-call markup before showing the message.
+                    text = ChatText.Strip(text);
                     if (!string.IsNullOrWhiteSpace(text))
                         Update?.Invoke(new AgentUpdate(ChatRole.Agent, "Assistant", text.Trim(), false));
                     break;
@@ -238,15 +241,17 @@ public sealed class AgentServerClient : IDisposable
                 }
                 case "ActionEvent":
                 {
-                    var thought = ExtractContentText(root, "thought");
+                    var thought = ChatText.Strip(ExtractContentText(root, "thought"));
                     if (!string.IsNullOrWhiteSpace(thought))
                         Update?.Invoke(new AgentUpdate(ChatRole.Thought, "Thinking", thought.Trim(), false));
 
                     var tool = GetString(root, "tool_name");
                     if (!string.IsNullOrWhiteSpace(tool))
                     {
-                        var detail = SummarizeAction(root);
-                        Update?.Invoke(new AgentUpdate(ChatRole.Tool, $"Tool: {tool}", detail, false));
+                        var (role, header, detail) = DescribeAction(tool!, root);
+                        // Always show the step header so the chat narrates every action,
+                        // even when the action carries no extra detail.
+                        Update?.Invoke(new AgentUpdate(role, header, detail, false));
                     }
                     break;
                 }
@@ -294,6 +299,9 @@ public sealed class AgentServerClient : IDisposable
                     }
                     break;
                 }
+                case "CondensationRequest":
+                    CompactingStarted?.Invoke();
+                    break;
                 case "Condensation":
                 case "CondensationSummaryEvent":
                     Compacted?.Invoke();
@@ -401,7 +409,81 @@ public sealed class AgentServerClient : IDisposable
         return sb.ToString();
     }
 
-    private static string SummarizeAction(JsonElement root)
+    /// <summary>
+    /// Turn a tool action into a friendly, step-by-step narration: a human header
+    /// ("Run command", "Read file", "Edit file", "Create file", "Plan", ...) plus a
+    /// concise detail (the command, the file path, a small preview of what changed).
+    /// Falls back to a generic "Tool: name" summary for unknown tools.
+    /// </summary>
+    private static (ChatRole role, string header, string detail) DescribeAction(string tool, JsonElement root)
+    {
+        bool hasAction = root.TryGetProperty("action", out var action)
+                         && action.ValueKind == JsonValueKind.Object;
+        string? sub = hasAction ? GetString(action, "command") : null;   // file_editor sub-verb
+
+        switch (tool.ToLowerInvariant())
+        {
+            case "terminal":
+            case "execute_bash":
+            case "bash":
+            {
+                var cmd = hasAction ? GetString(action, "command") : null;
+                return (ChatRole.Tool, "Run command",
+                        string.IsNullOrWhiteSpace(cmd) ? "(no command)" : "$ " + Truncate(cmd!, 2000));
+            }
+
+            case "file_editor":
+            case "str_replace_editor":
+            {
+                var path = hasAction ? GetString(action, "path") ?? "" : "";
+                switch ((sub ?? "").ToLowerInvariant())
+                {
+                    case "view":
+                        return (ChatRole.Tool, "Read file", path + ViewRange(action));
+                    case "create":
+                        return (ChatRole.Tool, "Create file",
+                                Join(path, Preview(GetString(action, "file_text"))));
+                    case "str_replace":
+                        return (ChatRole.Tool, "Edit file",
+                                Join(path, Preview(GetString(action, "new_str"))));
+                    case "insert":
+                    {
+                        var line = hasAction ? GetLong(action, "insert_line") : 0;
+                        return (ChatRole.Tool, "Edit file",
+                                Join($"{path} (insert at line {line})", Preview(GetString(action, "new_str"))));
+                    }
+                    case "undo_edit":
+                        return (ChatRole.Tool, "Undo edit", path);
+                    default:
+                        return (ChatRole.Tool, "Edit file", path);
+                }
+            }
+
+            case "task_tracker":
+            case "task_tool_set":
+                return (ChatRole.Tool, "Plan", DescribeTasks(action, hasAction, sub));
+
+            case "think":
+            case "thinktool":
+            {
+                var t = hasAction ? GetString(action, "thought") : null;
+                return (ChatRole.Thought, "Thinking", t ?? "");
+            }
+
+            case "finish":
+            case "finishtool":
+            {
+                var m = hasAction ? GetString(action, "message") : null;
+                return (ChatRole.Tool, "Finished", m ?? "");
+            }
+
+            default:
+                return (ChatRole.Tool, $"Tool: {tool}", SummarizeActionFallback(root));
+        }
+    }
+
+    /// <summary>Generic best-effort detail for an unrecognized tool.</summary>
+    private static string SummarizeActionFallback(JsonElement root)
     {
         if (root.TryGetProperty("action", out var action) && action.ValueKind == JsonValueKind.Object)
         {
@@ -412,6 +494,61 @@ public sealed class AgentServerClient : IDisposable
             }
         }
         return "";
+    }
+
+    /// <summary>Combine a one-line head with an optional indented preview block.</summary>
+    private static string Join(string head, string preview)
+        => string.IsNullOrEmpty(preview) ? head : head + "\n" + preview;
+
+    /// <summary>Short, trimmed preview of file content being written.</summary>
+    private static string Preview(string? text)
+        => string.IsNullOrWhiteSpace(text) ? "" : Truncate(text!.Trim(), 400);
+
+    /// <summary>Render a file_editor view_range like " (lines 10-40)" when present.</summary>
+    private static string ViewRange(JsonElement action)
+    {
+        if (action.ValueKind == JsonValueKind.Object
+            && action.TryGetProperty("view_range", out var r)
+            && r.ValueKind == JsonValueKind.Array)
+        {
+            var nums = new List<int>();
+            foreach (var e in r.EnumerateArray())
+                if (e.ValueKind == JsonValueKind.Number && e.TryGetInt32(out var n)) nums.Add(n);
+            if (nums.Count == 2) return $" (lines {nums[0]}-{nums[1]})";
+        }
+        return "";
+    }
+
+    /// <summary>Format the task_tracker plan as a checklist when tasks are present.</summary>
+    private static string DescribeTasks(JsonElement action, bool hasAction, string? sub)
+    {
+        if (!hasAction) return sub ?? "";
+
+        foreach (var key in new[] { "task_list", "tasks" })
+        {
+            if (!action.TryGetProperty(key, out var arr) || arr.ValueKind != JsonValueKind.Array)
+                continue;
+
+            var sb = new StringBuilder();
+            foreach (var item in arr.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.Object) continue;
+                var title = GetString(item, "title") ?? GetString(item, "description")
+                            ?? GetString(item, "task") ?? "";
+                if (string.IsNullOrWhiteSpace(title)) continue;
+
+                var mark = (GetString(item, "status") ?? "").ToLowerInvariant() switch
+                {
+                    "done" or "completed" => "[x]",
+                    "in_progress" or "doing" or "active" => "[~]",
+                    _ => "[ ]"
+                };
+                if (sb.Length > 0) sb.Append('\n');
+                sb.Append($"{mark} {title}");
+            }
+            if (sb.Length > 0) return sb.ToString();
+        }
+        return string.IsNullOrWhiteSpace(sub) ? "Updated task list" : $"Task list: {sub}";
     }
 
     private static string SummarizeObservation(JsonElement root)

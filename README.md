@@ -38,15 +38,19 @@ release pipeline. It is built on the upstream MIT-licensed OpenHands.
 ## Prerequisites
 
 1. **.NET 10 SDK** (to build) - the runtime is bundled when you publish.
-2. **OpenHands installed via uv**:
+2. **OpenHands agent-server** - StayVibin installs this for you automatically the
+   first time you press **Start** (it installs `uv` if needed, then runs
+   `uv tool install openhands`). To do it manually instead:
    ```
    uv tool install openhands
    ```
    The app expects `agent-server.exe` at
-   `%APPDATA%\uv\tools\openhands\Scripts\agent-server.exe`.
-3. **A configured model** - run the OpenHands CLI once so that
-   `~/.openhands/agent_settings.json` exists (this app reuses it).
-4. **Ollama** (or whatever provider the saved config points at) running.
+   `%APPDATA%\uv\tools\openhands\Scripts\agent-server.exe` (override in Settings).
+3. **A configured model** - on first launch StayVibin shows a provider setup box
+   (Ollama for now) and writes `~/.openhands/agent_settings.json` for you. If a
+   config already exists (e.g. from the OpenHands CLI) it is reused as-is.
+4. **Ollama** running with at least one chat model pulled (e.g. `ollama pull
+   qwen2.5-coder:14b`). More local providers are planned.
 
 > Note: the agent-server, sdk, and tools packages must be version-compatible.
 > This repo was validated against `openhands-sdk==1.21.0` /
@@ -80,7 +84,7 @@ This publishes a self-contained `StayVibin.exe` and compiles a full setup wizard
 Inno Setup 6 (downloaded automatically if it is not already installed). Output:
 
 ```
-dist\StayVibin-1.0.0-setup.exe
+dist\StayVibin-<version>-setup.exe
 ```
 
 The installer adds Start menu and Add/Remove Programs entries. Optional desktop shortcut.
@@ -101,7 +105,8 @@ Download the latest release from
 
 - Single conversation per session, with Start/Stop, Interrupt, and Steer.
 - Renders user/assistant messages, agent thoughts, tool calls, results, errors.
-- Model dropdown sourced from local Ollama, with hot-swap mid-session.
+- Model dropdown sourced from local Ollama, with hot-swap mid-session and a
+  refresh button to pick up newly pulled models instantly.
 - Auto-tunes temperature / reasoning / context per selected model (toggleable).
 - Token + context usage strip with manual and automatic compaction.
 - Model capability strip (chat / tools / vision / etc.) with tooltips.
@@ -111,3 +116,15 @@ Download the latest release from
   `%APPDATA%\StayVibin`.
 - Live token streaming is rendered if the backend emits it; otherwise the final
   message is shown when the turn completes.
+
+## What's new in v1.0.1
+
+- Model dropdown refresh button - newly pulled Ollama models appear without a restart.
+- Context window now adapts per model up to a user-set ceiling (Settings -> "Max
+  context"); raise it for more context, lower it to save RAM. Default 64K.
+- Step-by-step narration of agent actions (Run command, Read/Edit/Create file,
+  Plan, ...) instead of a generic tool line.
+- Leaked tool-call markup (`<function=...>`) is stripped from assistant messages.
+- Reliability: model metadata no longer caches transient failures, model loading
+  is serialized, session teardown no longer blocks the UI, and external command
+  helpers read stdout/stderr concurrently to avoid pipe-buffer deadlocks.

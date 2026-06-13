@@ -20,8 +20,13 @@ public sealed class AppSettings
     public string AgentServerPath { get; set; } = "";
     /// <summary>Default working folder for new sessions; empty = user profile.</summary>
     public string DefaultWorkingDir { get; set; } = "";
-    /// <summary>Token context window passed to the server (OLLAMA_CONTEXT_LENGTH).</summary>
-    public int ContextLength { get; set; } = 32768;
+    /// <summary>
+    /// Maximum context window (tokens). Used as the OLLAMA_CONTEXT_LENGTH the server
+    /// launches with, and as the ceiling for AutoTune: AutoTune sizes each model to
+    /// min(its native window, this value), so small models use less and large models
+    /// are capped here. Raise it for more context (more RAM/VRAM), lower it to save.
+    /// </summary>
+    public int ContextLength { get; set; } = 65536;
     /// <summary>Maximum agent loop iterations per conversation.</summary>
     public int MaxIterations { get; set; } = 500;
 
@@ -70,7 +75,7 @@ public sealed class AppSettings
     private AppSettings Normalized()
     {
         if (Port is <= 0 or > 65535) Port = 8000;
-        if (ContextLength < 1024) ContextLength = 32768;
+        if (ContextLength < 1024) ContextLength = 65536;
         if (MaxIterations < 1) MaxIterations = 500;
         if (string.IsNullOrWhiteSpace(Host)) Host = "127.0.0.1";
         if (string.IsNullOrWhiteSpace(OllamaUrl)) OllamaUrl = "http://localhost:11434";

@@ -27,6 +27,26 @@ public static class AgentSpecProvider
         + "path as the LAST argument - a bare 'rg \"pattern\"' hangs on stdin).\n"
         + "- Prefer ripgrep over 'Select-String -Recurse'/'Get-ChildItem -Recurse'/"
         + "'findstr /s', which are slow and scan .git and binaries.\n"
+        + "\n"
+        + "Windows PowerShell terminal - follow these exactly to avoid jamming the shell:\n"
+        + "- This machine runs Windows PowerShell. Chain commands with ';' - NEVER use "
+        + "'&&' or '||'. They are parse errors in PowerShell ('the token && is not a "
+        + "valid statement separator') and they break the command wrapper, which jams "
+        + "the session so that EVERY later command is rejected with 'the previous "
+        + "command is still running'.\n"
+        + "- Run ONE command per action. Use native cmdlets / aliases: 'Get-ChildItem' "
+        + "(ls/dir), 'Get-Content' (cat), 'Set-Location' (cd), 'Get-Location' (pwd).\n"
+        + "- Recovering a stuck terminal: if a terminal result has exit code -1, or says "
+        + "'no new output after 60 seconds', or 'the previous command is still running "
+        + "/ is NOT executed', the shell is busy waiting on the PREVIOUS command. Do NOT "
+        + "keep sending new commands - they will all be rejected and you will loop. "
+        + "Instead send exactly ONE terminal action with is_input=true and command "
+        + "'C-c' to interrupt it, then continue with your next real command.\n"
+        + "- NEVER set reset=true together with is_input=true - that combination errors "
+        + "out ('Cannot use reset=True with is_input=True'). To get a fresh shell, send "
+        + "reset=true with a normal command and is_input=false.\n"
+        + "- Never send the same command again after it fails. If an approach fails twice, "
+        + "STOP and change the approach - do not repeat yourself in a loop.\n"
         + "- Do NOT refuse reasonable engineering requests (audits, refactors, reviews, "
         + "large multi-file tasks). Break the work into concrete steps and complete "
         + "them one at a time, reporting progress as you go.\n"
@@ -107,6 +127,101 @@ public static class AgentSpecProvider
     }
 
     public static bool SettingsExist => File.Exists(DefaultSettingsPath());
+
+    /// <summary>
+    /// Write a fresh agent_settings.json for a local OpenAI-compatible provider
+    /// (currently Ollama) so first-run users never have to run the OpenHands CLI.
+    /// The schema mirrors what the CLI persists; only the model and base URL vary.
+    /// </summary>
+    public static void CreateDefault(string model, string providerBaseUrl, string? path = null)
+    {
+        path ??= DefaultSettingsPath();
+        var dir = Path.GetDirectoryName(path);
+        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+
+        var baseUrl = NormalizeOpenAiBaseUrl(providerBaseUrl);
+        var modelField = model.Contains('/') ? model : "openai/" + model;
+
+        var spec = new JsonObject
+        {
+            ["llm"] = BuildLlm(modelField, baseUrl, "agent"),
+            ["tools"] = new JsonArray(
+                ToolNode("terminal"), ToolNode("file_editor"),
+                ToolNode("task_tracker"), ToolNode("task_tool_set")),
+            ["filter_tools_regex"] = null,
+            ["include_default_tools"] = new JsonArray("FinishTool", "ThinkTool"),
+            ["agent_context"] = null,
+            ["system_prompt"] = null,
+            ["system_prompt_filename"] = "system_prompt.j2",
+            ["security_policy_filename"] = "security_policy.j2",
+            ["system_prompt_kwargs"] = new JsonObject { ["llm_security_analyzer"] = true },
+            ["condenser"] = new JsonObject
+            {
+                ["llm"] = BuildLlm(modelField, baseUrl, "condenser"),
+                ["max_size"] = 240,
+                ["max_tokens"] = null,
+                ["keep_first"] = 2,
+                ["minimum_progress"] = 0.1,
+                ["hard_context_reset_max_retries"] = 5,
+                ["hard_context_reset_context_scaling"] = 0.8,
+                ["kind"] = "LLMSummarizingCondenser"
+            },
+            ["critic"] = null,
+            ["tool_concurrency_limit"] = 1,
+            ["kind"] = "Agent"
+        };
+
+        Save(spec, path);
+    }
+
+    private static JsonObject ToolNode(string name)
+        => new() { ["name"] = name, ["params"] = new JsonObject() };
+
+    /// <summary>Build one LLM block matching the CLI's agent_settings.json schema.</summary>
+    private static JsonObject BuildLlm(string modelField, string baseUrl, string usageId) => new()
+    {
+        ["model"] = modelField,
+        ["api_key"] = "local-llm",
+        ["base_url"] = baseUrl,
+        ["api_version"] = null,
+        ["openrouter_site_url"] = "https://docs.all-hands.dev/",
+        ["openrouter_app_name"] = "OpenHands",
+        ["num_retries"] = 5,
+        ["retry_multiplier"] = 8.0,
+        ["retry_min_wait"] = 8,
+        ["retry_max_wait"] = 64,
+        ["timeout"] = 300,
+        ["max_message_chars"] = 30000,
+        ["temperature"] = null,
+        ["top_p"] = null,
+        ["top_k"] = null,
+        ["max_input_tokens"] = null,
+        ["max_output_tokens"] = null,
+        ["stream"] = false,
+        ["drop_params"] = true,
+        ["modify_params"] = true,
+        ["disable_stop_word"] = false,
+        ["caching_prompt"] = true,
+        ["log_completions"] = false,
+        ["log_completions_folder"] = "logs\\completions",
+        ["native_tool_calling"] = false,
+        ["reasoning_effort"] = "high",
+        ["enable_encrypted_reasoning"] = true,
+        ["prompt_cache_retention"] = "24h",
+        ["extended_thinking_budget"] = 200000,
+        ["seed"] = null,
+        ["usage_id"] = usageId,
+        ["litellm_extra_body"] = new JsonObject()
+    };
+
+    /// <summary>Coerce a provider URL into the OpenAI-compatible '.../v1' form.</summary>
+    private static string NormalizeOpenAiBaseUrl(string url)
+    {
+        var u = (url ?? "").Trim().TrimEnd('/');
+        if (u.Length == 0) u = "http://localhost:11434";
+        if (!u.EndsWith("/v1", StringComparison.OrdinalIgnoreCase)) u += "/v1";
+        return u;
+    }
 
     /// <summary>
     /// Read and return the agent spec as a mutable JsonNode. Forces non-native

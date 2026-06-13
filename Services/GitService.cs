@@ -195,8 +195,13 @@ public static class GitService
 
             using var p = new Process { StartInfo = psi };
             p.Start();
-            var stdout = await p.StandardOutput.ReadToEndAsync();
-            var stderr = await p.StandardError.ReadToEndAsync();
+            // Read both pipes concurrently: draining stdout fully before stderr can
+            // deadlock if the child fills its stderr buffer (and vice versa).
+            var stdoutTask = p.StandardOutput.ReadToEndAsync();
+            var stderrTask = p.StandardError.ReadToEndAsync();
+            await Task.WhenAll(stdoutTask, stderrTask);
+            var stdout = stdoutTask.Result;
+            var stderr = stderrTask.Result;
             if (!p.WaitForExit(15000)) { try { p.Kill(true); } catch { } return (false, ""); }
             // On success, use stdout only. On failure, keep stderr for callers
             // that intentionally parse command diagnostics (currently gh auth).

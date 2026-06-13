@@ -176,10 +176,13 @@ public static class AttachmentService
                 }
             };
             p.Start();
-            var stdout = await p.StandardOutput.ReadToEndAsync();
-            _ = await p.StandardError.ReadToEndAsync();
+            // Read both pipes concurrently to avoid a pipe-buffer deadlock - ffmpeg
+            // in particular is chatty on stderr while we read stdout.
+            var stdoutTask = p.StandardOutput.ReadToEndAsync();
+            var stderrTask = p.StandardError.ReadToEndAsync();
+            await Task.WhenAll(stdoutTask, stderrTask);
             if (!p.WaitForExit(60000)) { try { p.Kill(true); } catch { } return (false, ""); }
-            return (p.ExitCode == 0, stdout);
+            return (p.ExitCode == 0, stdoutTask.Result);
         }
         catch
         {

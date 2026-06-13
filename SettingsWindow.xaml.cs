@@ -207,7 +207,7 @@ public partial class SettingsWindow : Window
         if (!int.TryParse(PortBox.Text, out var port) || port is <= 0 or > 65535)
         { ShowError("Port must be a number between 1 and 65535."); return; }
         if (!int.TryParse(ContextLenBox.Text, out var ctx) || ctx < 1024)
-        { ShowError("Context length must be a number >= 1024."); return; }
+        { ShowError("Max context must be a number >= 1024."); return; }
         if (!int.TryParse(MaxIterBox.Text, out var maxIter) || maxIter < 1)
         { ShowError("Max iterations must be a positive number."); return; }
 

@@ -31,7 +31,7 @@ public sealed class BackendManager : IDisposable
         string host = "127.0.0.1",
         int port = 8000,
         string? executablePath = null,
-        int contextLength = 32768)
+        int contextLength = 65536)
     {
         Host = host;
         Port = port;
@@ -62,7 +62,8 @@ public sealed class BackendManager : IDisposable
         if (!ExecutableExists)
             throw new FileNotFoundException(
                 $"agent-server.exe not found at:\n{ExecutablePath}\n\n" +
-                "Install OpenHands with: uv tool install openhands\n" +
+                "Press Start to let StayVibin install it automatically, or install " +
+                "OpenHands manually with: uv tool install openhands\n" +
                 "Or set the path in Settings.", ExecutablePath);
 
         OpenLogFile();

@@ -11,16 +11,18 @@ public sealed record ModelInfo(
 /// <summary>
 /// Read-only client for the local Ollama instance: lists installed models and
 /// reads per-model metadata (context length, family, capabilities). Model
-/// metadata is immutable for a given tag, so it is cached for the app lifetime
-/// (including failed lookups, so we do not hammer a missing model).
+/// metadata is immutable for a given tag, so successful lookups are cached for the
+/// app lifetime. Failures are NOT cached (they are usually transient - Ollama not
+/// up yet), so a later retry or a Refresh re-queries them. Call
+/// <see cref="ClearCache"/> to force a full re-fetch.
 /// </summary>
 public sealed class OllamaClient : IDisposable
 {
     private readonly string _baseUrl;
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(4) };
 
-    // Value is null when the model is unknown or Ollama was unreachable.
-    private readonly ConcurrentDictionary<string, ModelInfo?> _infoCache =
+    // Only successful lookups are stored; a missing entry means "not fetched yet".
+    private readonly ConcurrentDictionary<string, ModelInfo> _infoCache =
         new(StringComparer.OrdinalIgnoreCase);
 
     public OllamaClient(string baseUrl = "http://localhost:11434")
@@ -81,10 +83,7 @@ public sealed class OllamaClient : IDisposable
             };
             using var resp = await _http.SendAsync(req, ct);
             if (!resp.IsSuccessStatusCode)
-            {
-                _infoCache[model] = null;
-                return null;
-            }
+                return null;   // transient/unknown - don't cache, allow a later retry
 
             using var stream = await resp.Content.ReadAsStreamAsync(ct);
             using var doc = await JsonDocument.ParseAsync(stream, cancellationToken: ct);
@@ -124,10 +123,12 @@ public sealed class OllamaClient : IDisposable
         }
         catch
         {
-            _infoCache[model] = null;
-            return null;
+            return null;   // transient (timeout/offline) - don't cache
         }
     }
+
+    /// <summary>Forget cached metadata so the next lookup re-queries Ollama (used by Refresh).</summary>
+    public void ClearCache() => _infoCache.Clear();
 
     public void Dispose() => _http.Dispose();
 }

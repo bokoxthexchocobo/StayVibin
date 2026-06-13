@@ -7,16 +7,21 @@ public sealed record TuneResult(double Temperature, int ContextLength, string Re
 /// Picks sensible defaults so newbies never have to touch temperature/context.
 /// Coding models run deterministic (temp 0) to stop them rambling; thinking/reasoning
 /// models (DeepSeek-R1, QwQ, Qwen3, Ollama "thinking" capability, etc.) get higher
-/// reasoning effort and a little temperature headroom. Context is taken from the
-/// model's real window, capped to stay light on local RAM.
+/// reasoning effort and a little temperature headroom. Context adapts to the model's
+/// real window, capped at a user-controlled ceiling to stay light on local RAM.
 /// </summary>
 public static class ModelTuning
 {
-    // Safe ceiling for local machines; raise in Settings if you have the RAM.
-    public const int ContextCap = 32768;
+    // Default ceiling when the caller doesn't supply one (matches AppSettings).
+    public const int DefaultContextCap = 65536;
     public const int ContextFloor = 4096;
 
-    public static TuneResult Recommend(string model, ModelInfo? info)
+    /// <param name="contextCap">
+    /// Upper bound on the runtime context window (tokens). The chosen context is
+    /// min(model's native window, this cap), so smaller models use less and larger
+    /// models are clamped here. Defaults to <see cref="DefaultContextCap"/>.
+    /// </param>
+    public static TuneResult Recommend(string model, ModelInfo? info, int contextCap = DefaultContextCap)
     {
         var name = (model ?? "").ToLowerInvariant();
 
@@ -28,8 +33,10 @@ public static class ModelTuning
         double temperature = isCoder ? 0.0 : isThinking ? 0.55 : 0.2;
         string reasoning = isThinking ? "high" : "low";
 
+        // Guard against a nonsensical cap, then fit the model's native window into it.
+        int cap = contextCap > 0 ? contextCap : DefaultContextCap;
         long native = info?.ContextLength ?? 0;
-        int ctx = native > 0 ? (int)Math.Min(native, ContextCap) : ContextCap;
+        int ctx = native > 0 ? (int)Math.Min(native, cap) : cap;
         if (ctx < ContextFloor) ctx = ContextFloor;
 
         return new TuneResult(temperature, ctx, reasoning);
