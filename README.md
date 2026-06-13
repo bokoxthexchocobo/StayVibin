@@ -128,3 +128,15 @@ Download the latest release from
 - Reliability: model metadata no longer caches transient failures, model loading
   is serialized, session teardown no longer blocks the UI, and external command
   helpers read stdout/stderr concurrently to avoid pipe-buffer deadlocks.
+
+## License
+
+StayVibin is released under the MIT License (Modified with Ethical AI Use Clause) -
+see [LICENSE](LICENSE). In short: standard MIT permissions, plus an ethical-use
+restriction that prohibits using the Software to cause intentional harm (e.g.
+disinformation, non-consensual deepfakes, phishing, autonomous weapons, malicious
+cyber-attacks or surveillance, or any illegal activity). Breaching that clause
+automatically voids the license.
+
+This project is built on the upstream MIT-licensed OpenHands, which retains its
+own license.
