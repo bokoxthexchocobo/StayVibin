@@ -1,0 +1,160 @@
+<Window x:Class="StayVibin.SettingsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Settings" Height="720" Width="640"
+        Icon="Assets/stayvibin.png"
+        Background="{StaticResource Bg}"
+        WindowStartupLocation="CenterOwner"
+        FontFamily="Segoe UI" FontSize="14"
+        ResizeMode="CanResize">
+
+    <Grid Margin="0">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto" Padding="22,16">
+            <StackPanel>
+                <TextBlock Text="Model and LLM" Style="{StaticResource SectionHeader}" Margin="0,0,0,8"/>
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="190"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="40"/>
+                        <RowDefinition Height="40"/>
+                        <RowDefinition Height="40"/>
+                        <RowDefinition Height="40"/>
+                        <RowDefinition Height="40"/>
+                        <RowDefinition Height="40"/>
+                    </Grid.RowDefinitions>
+
+                    <TextBlock Grid.Row="0" Grid.Column="0" Text="Default model" Style="{StaticResource FieldLabel}"/>
+                    <ComboBox x:Name="ModelBox" Grid.Row="0" Grid.Column="1" Style="{StaticResource DarkCombo}"
+                              IsEditable="True" VerticalAlignment="Center"
+                              ToolTip="Detected Ollama models; you can also type a model id"/>
+
+                    <TextBlock Grid.Row="1" Grid.Column="0" Text="API key" Style="{StaticResource FieldLabel}"/>
+                    <TextBox x:Name="ApiKeyBox" Grid.Row="1" Grid.Column="1" Style="{StaticResource DarkInput}"
+                             VerticalAlignment="Center"
+                             ToolTip="Use 'local-llm' for Ollama, or a real key for cloud providers"/>
+
+                    <TextBlock Grid.Row="2" Grid.Column="0" Text="LLM base URL" Style="{StaticResource FieldLabel}"/>
+                    <TextBox x:Name="BaseUrlBox" Grid.Row="2" Grid.Column="1" Style="{StaticResource DarkInput}"
+                             VerticalAlignment="Center"
+                             ToolTip="OpenAI-compatible endpoint, e.g. http://localhost:11434/v1"/>
+
+                    <TextBlock Grid.Row="3" Grid.Column="0" Text="Temperature" Style="{StaticResource FieldLabel}"/>
+                    <TextBox x:Name="TemperatureBox" Grid.Row="3" Grid.Column="1" Style="{StaticResource DarkInput}"
+                             VerticalAlignment="Center" ToolTip="Blank = model default (e.g. 0.0 - 1.0)"/>
+
+                    <TextBlock Grid.Row="4" Grid.Column="0" Text="Reasoning effort" Style="{StaticResource FieldLabel}"/>
+                    <ComboBox x:Name="ReasoningBox" Grid.Row="4" Grid.Column="1" Style="{StaticResource DarkCombo}"
+                              VerticalAlignment="Center" Width="160" HorizontalAlignment="Left">
+                        <ComboBoxItem Content="high"/>
+                        <ComboBoxItem Content="medium"/>
+                        <ComboBoxItem Content="low"/>
+                        <ComboBoxItem Content="none"/>
+                    </ComboBox>
+
+                    <TextBlock Grid.Row="5" Grid.Column="0" Text="Auto-compact at (events)" Style="{StaticResource FieldLabel}"/>
+                    <TextBox x:Name="CondenserBox" Grid.Row="5" Grid.Column="1" Style="{StaticResource DarkInput}"
+                             VerticalAlignment="Center" Width="160" HorizontalAlignment="Left"
+                             ToolTip="History is summarized once it grows past this many events"/>
+                </Grid>
+
+                <CheckBox x:Name="NonNativeBox" Content="Force prompt-based tool calling (recommended for local models)"
+                          Foreground="{StaticResource Text}" Margin="0,10,0,0" IsChecked="True"
+                          ToolTip="Hides raw tool-call syntax from models that don't support native function calling"/>
+
+                <TextBlock Text="Connection" Style="{StaticResource SectionHeader}"/>
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="190"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="40"/>
+                        <RowDefinition Height="40"/>
+                        <RowDefinition Height="40"/>
+                        <RowDefinition Height="40"/>
+                    </Grid.RowDefinitions>
+
+                    <TextBlock Grid.Row="0" Grid.Column="0" Text="Agent-server host" Style="{StaticResource FieldLabel}"/>
+                    <TextBox x:Name="HostBox" Grid.Row="0" Grid.Column="1" Grid.ColumnSpan="2"
+                             Style="{StaticResource DarkInput}" VerticalAlignment="Center"/>
+
+                    <TextBlock Grid.Row="1" Grid.Column="0" Text="Agent-server port" Style="{StaticResource FieldLabel}"/>
+                    <TextBox x:Name="PortBox" Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="2"
+                             Style="{StaticResource DarkInput}" VerticalAlignment="Center"/>
+
+                    <TextBlock Grid.Row="2" Grid.Column="0" Text="Ollama URL" Style="{StaticResource FieldLabel}"/>
+                    <TextBox x:Name="OllamaBox" Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="2"
+                             Style="{StaticResource DarkInput}" VerticalAlignment="Center"/>
+
+                    <TextBlock Grid.Row="3" Grid.Column="0" Text="agent-server.exe path" Style="{StaticResource FieldLabel}"/>
+                    <TextBox x:Name="ExePathBox" Grid.Row="3" Grid.Column="1" Style="{StaticResource DarkInput}"
+                             VerticalAlignment="Center" ToolTip="Leave blank to auto-detect the uv install"/>
+                    <Button x:Name="BrowseExeButton" Grid.Row="3" Grid.Column="2" Content="..."
+                            Style="{StaticResource FlatButton}" Margin="8,0,0,0" Padding="12,5"
+                            Click="OnBrowseExe"/>
+                </Grid>
+
+                <TextBlock Text="Behavior" Style="{StaticResource SectionHeader}"/>
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="190"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="40"/>
+                        <RowDefinition Height="40"/>
+                        <RowDefinition Height="40"/>
+                    </Grid.RowDefinitions>
+
+                    <TextBlock Grid.Row="0" Grid.Column="0" Text="Context length (tokens)" Style="{StaticResource FieldLabel}"/>
+                    <TextBox x:Name="ContextLenBox" Grid.Row="0" Grid.Column="1" Grid.ColumnSpan="2"
+                             Style="{StaticResource DarkInput}" VerticalAlignment="Center"
+                             ToolTip="OLLAMA_CONTEXT_LENGTH passed to the server"/>
+
+                    <TextBlock Grid.Row="1" Grid.Column="0" Text="Max iterations" Style="{StaticResource FieldLabel}"/>
+                    <TextBox x:Name="MaxIterBox" Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="2"
+                             Style="{StaticResource DarkInput}" VerticalAlignment="Center"/>
+
+                    <TextBlock Grid.Row="2" Grid.Column="0" Text="Default working folder" Style="{StaticResource FieldLabel}"/>
+                    <TextBox x:Name="WorkDirBox" Grid.Row="2" Grid.Column="1" Style="{StaticResource DarkInput}"
+                             VerticalAlignment="Center" ToolTip="Blank = your user profile folder"/>
+                    <Button x:Name="BrowseDirButton" Grid.Row="2" Grid.Column="2" Content="..."
+                            Style="{StaticResource FlatButton}" Margin="8,0,0,0" Padding="12,5"
+                            Click="OnBrowseDir"/>
+                </Grid>
+
+                <CheckBox x:Name="AutoTuneBox" Margin="0,12,0,0" IsChecked="True"
+                          Foreground="{StaticResource Text}"
+                          Content="Auto-tune temperature, reasoning and context for the selected model (recommended)"
+                          ToolTip="Detects each model's settings from Ollama so you don't have to. Overrides the temperature/context fields above on start."/>
+
+                <TextBlock x:Name="ErrorText" Foreground="{StaticResource Err}" FontSize="12"
+                           Margin="0,16,0,0" TextWrapping="Wrap" Visibility="Collapsed"/>
+            </StackPanel>
+        </ScrollViewer>
+
+        <Border Grid.Row="1" Background="{StaticResource Panel}" BorderBrush="{StaticResource Border}"
+                BorderThickness="0,1,0,0" Padding="16,12">
+            <Grid>
+                <Button x:Name="OpenLogsButton" Content="Open logs folder" Style="{StaticResource FlatButton}"
+                        HorizontalAlignment="Left" Click="OnOpenLogs"/>
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                    <Button x:Name="CancelButton" Content="Cancel" Style="{StaticResource FlatButton}"
+                            Click="OnCancel" Margin="0,0,8,0"/>
+                    <Button x:Name="SaveButton" Content="Save" Style="{StaticResource AccentButton}"
+                            Click="OnSave"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>

@@ -1,0 +1,205 @@
+using System.Globalization;
+using System.Text.Json.Nodes;
+using System.Windows;
+using System.Windows.Controls;
+using Microsoft.Win32;
+using StayVibin.Services;
+
+namespace StayVibin;
+
+/// <summary>
+/// Modal settings editor. App-level preferences are written to AppSettings; the
+/// model/LLM fields are read from and written back to ~/.openhands/agent_settings.json.
+/// If that file doesn't exist yet, the model section is disabled but app settings
+/// can still be edited.
+/// </summary>
+public partial class SettingsWindow : Window
+{
+    private readonly AppSettings _settings;
+    private JsonNode? _spec;     // agent_settings.json (null if not configured yet)
+
+    public SettingsWindow(AppSettings settings, IReadOnlyList<string> models)
+    {
+        InitializeComponent();
+        _settings = settings;
+
+        // App settings
+        HostBox.Text = settings.Host;
+        PortBox.Text = settings.Port.ToString();
+        OllamaBox.Text = settings.OllamaUrl;
+        ExePathBox.Text = settings.AgentServerPath;
+        ContextLenBox.Text = settings.ContextLength.ToString();
+        MaxIterBox.Text = settings.MaxIterations.ToString();
+        WorkDirBox.Text = settings.DefaultWorkingDir;
+        AutoTuneBox.IsChecked = settings.AutoTune;
+
+        // Model list
+        foreach (var m in models) ModelBox.Items.Add(m);
+
+        // Agent spec (model + llm)
+        try
+        {
+            _spec = AgentSpecProvider.LoadRaw();
+            var llm = _spec["llm"];
+            var model = StripProvider(llm?["model"]?.GetValue<string>() ?? "");
+            if (!string.IsNullOrEmpty(model) && !ModelBox.Items.Contains(model))
+                ModelBox.Items.Insert(0, model);
+            ModelBox.Text = model;
+
+            ApiKeyBox.Text = llm?["api_key"]?.GetValue<string>() ?? "";
+            BaseUrlBox.Text = llm?["base_url"]?.GetValue<string>() ?? "";
+            TemperatureBox.Text = llm?["temperature"]?.GetValue<double>().ToString(CultureInfo.InvariantCulture) ?? "";
+            SelectReasoning(llm?["reasoning_effort"]?.GetValue<string>());
+            NonNativeBox.IsChecked = !(llm?["native_tool_calling"]?.GetValue<bool>() ?? false);
+            CondenserBox.Text = (_spec["condenser"]?["max_size"]?.GetValue<int>() ?? 240).ToString();
+        }
+        catch
+        {
+            // No agent config yet - allow editing app settings only.
+            ModelBox.IsEnabled = false;
+            ApiKeyBox.IsEnabled = false;
+            BaseUrlBox.IsEnabled = false;
+            TemperatureBox.IsEnabled = false;
+            ReasoningBox.IsEnabled = false;
+            CondenserBox.IsEnabled = false;
+            NonNativeBox.IsEnabled = false;
+            ShowError("No saved model config found (~/.openhands/agent_settings.json). "
+                      + "Run the OpenHands CLI once to configure a model; app settings below still apply.");
+        }
+    }
+
+    private void SelectReasoning(string? value)
+    {
+        value ??= "high";
+        foreach (var obj in ReasoningBox.Items)
+            if (obj is ComboBoxItem it && (it.Content as string) == value)
+            {
+                ReasoningBox.SelectedItem = it;
+                return;
+            }
+        ReasoningBox.SelectedIndex = 0;
+    }
+
+    private void OnBrowseExe(object sender, RoutedEventArgs e)
+    {
+        var dlg = new OpenFileDialog
+        {
+            Title = "Select agent-server.exe",
+            Filter = "Executable (*.exe)|*.exe|All files (*.*)|*.*"
+        };
+        if (dlg.ShowDialog(this) == true) ExePathBox.Text = dlg.FileName;
+    }
+
+    private void OnBrowseDir(object sender, RoutedEventArgs e)
+    {
+        var dlg = new OpenFolderDialog { Title = "Select default working folder" };
+        if (dlg.ShowDialog(this) == true) WorkDirBox.Text = dlg.FolderName;
+    }
+
+    private void OnOpenLogs(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = AppPaths.LogsDir,
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex) { ShowError(ex.Message); }
+    }
+
+    private void OnCancel(object sender, RoutedEventArgs e)
+    {
+        DialogResult = false;
+        Close();
+    }
+
+    private void OnSave(object sender, RoutedEventArgs e)
+    {
+        HideError();
+
+        if (!int.TryParse(PortBox.Text, out var port) || port is <= 0 or > 65535)
+        { ShowError("Port must be a number between 1 and 65535."); return; }
+        if (!int.TryParse(ContextLenBox.Text, out var ctx) || ctx < 1024)
+        { ShowError("Context length must be a number >= 1024."); return; }
+        if (!int.TryParse(MaxIterBox.Text, out var maxIter) || maxIter < 1)
+        { ShowError("Max iterations must be a positive number."); return; }
+
+        double? temperature = null;
+        if (!string.IsNullOrWhiteSpace(TemperatureBox.Text))
+        {
+            if (!double.TryParse(TemperatureBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var t))
+            { ShowError("Temperature must be a number (or blank)."); return; }
+            temperature = t;
+        }
+
+        int condenser = 240;
+        if (_spec is not null && (!int.TryParse(CondenserBox.Text, out condenser) || condenser < 10))
+        { ShowError("Auto-compact threshold must be a number >= 10."); return; }
+
+        // Save app settings
+        _settings.Host = HostBox.Text.Trim();
+        _settings.Port = port;
+        _settings.OllamaUrl = OllamaBox.Text.Trim();
+        _settings.AgentServerPath = ExePathBox.Text.Trim();
+        _settings.ContextLength = ctx;
+        _settings.MaxIterations = maxIter;
+        _settings.DefaultWorkingDir = WorkDirBox.Text.Trim();
+        _settings.AutoTune = AutoTuneBox.IsChecked == true;
+        _settings.Save();
+
+        // Save model/agent config
+        if (_spec is not null)
+        {
+            try
+            {
+                var model = ToModelField(ModelBox.Text.Trim());
+                var apiKey = ApiKeyBox.Text.Trim();
+                var baseUrl = BaseUrlBox.Text.Trim();
+                var reasoning = (ReasoningBox.SelectedItem as ComboBoxItem)?.Content as string ?? "high";
+                var nonNative = NonNativeBox.IsChecked == true;
+
+                ApplyLlm(_spec["llm"], model, apiKey, baseUrl, temperature, reasoning, nonNative);
+                ApplyLlm(_spec["condenser"]?["llm"], model, apiKey, baseUrl, temperature, reasoning, nonNative);
+                if (_spec["condenser"] is JsonObject cond) cond["max_size"] = condenser;
+
+                AgentSpecProvider.Save(_spec);
+            }
+            catch (Exception ex)
+            {
+                ShowError($"Could not save model settings: {ex.Message}");
+                return;
+            }
+        }
+
+        DialogResult = true;
+        Close();
+    }
+
+    private static void ApplyLlm(JsonNode? llm, string model, string apiKey, string baseUrl,
+        double? temperature, string reasoning, bool nonNative)
+    {
+        if (llm is not JsonObject o) return;
+        if (!string.IsNullOrEmpty(model)) o["model"] = model;
+        o["api_key"] = string.IsNullOrEmpty(apiKey) ? "local-llm" : apiKey;
+        if (!string.IsNullOrEmpty(baseUrl)) o["base_url"] = baseUrl;
+        o["temperature"] = temperature is null ? null : JsonValue.Create(temperature.Value);
+        o["reasoning_effort"] = reasoning;
+        o["native_tool_calling"] = !nonNative;
+    }
+
+    private static string StripProvider(string model)
+        => model.StartsWith("openai/", StringComparison.OrdinalIgnoreCase) ? model["openai/".Length..] : model;
+
+    private static string ToModelField(string name)
+        => string.IsNullOrEmpty(name) ? name : (name.Contains('/') ? name : "openai/" + name);
+
+    private void ShowError(string msg)
+    {
+        ErrorText.Text = msg;
+        ErrorText.Visibility = Visibility.Visible;
+    }
+
+    private void HideError() => ErrorText.Visibility = Visibility.Collapsed;
+}
