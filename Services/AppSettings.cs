@@ -1,7 +1,34 @@
 using System.IO;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace StayVibin.Services;
+
+/// <summary>
+/// How the agent should plan before acting. The operator sets this; the agent is
+/// told about the active mode in its system prompt.
+/// </summary>
+public enum PlanMode
+{
+    /// <summary>No planning gate - the agent just does the work.</summary>
+    Off,
+    /// <summary>Default: the agent asks the operator whether to plan first.</summary>
+    Ask,
+    /// <summary>The agent decides on its own when a task is complex enough to plan first.</summary>
+    Auto,
+    /// <summary>Every task starts with a plan the operator must approve.</summary>
+    Always
+}
+
+/// <summary>
+/// Operator permission mode for potentially risky agent actions. Ask maps to the
+/// OpenHands confirmation policy; AllowAll maps to NeverConfirm.
+/// </summary>
+public enum PermissionMode
+{
+    Ask,
+    AllowAll
+}
 
 /// <summary>
 /// App-level preferences (connection + behavior) persisted to
@@ -46,6 +73,21 @@ public sealed class AppSettings
     /// reasoning effort and context size detected from Ollama (newbie-friendly).
     /// </summary>
     public bool AutoTune { get; set; } = true;
+
+    /// <summary>
+    /// How the agent plans before acting. Stored as a string for a readable,
+    /// version-stable settings.json. Defaults to Ask so first-timers are walked
+    /// through "plan or just go" instead of getting surprise changes.
+    /// </summary>
+    [JsonConverter(typeof(JsonStringEnumConverter))]
+    public PlanMode PlanMode { get; set; } = PlanMode.Ask;
+
+    /// <summary>
+    /// Whether potentially risky agent actions require operator confirmation.
+    /// Defaults to Ask for human-friendly safety; power users can switch to AllowAll.
+    /// </summary>
+    [JsonConverter(typeof(JsonStringEnumConverter))]
+    public PermissionMode PermissionMode { get; set; } = PermissionMode.Ask;
 
     private static readonly JsonSerializerOptions Opts = new() { WriteIndented = true };
 

@@ -120,6 +120,57 @@ public static class AgentSpecProvider
         + "that as a hint for what they care about, but still read the file before "
         + "claiming what is in it.";
 
+    /// <summary>
+    /// Sentinel the agent prints on its own line when a plan is ready for the
+    /// operator to approve. StayVibin detects this to show the Approve/Request-
+    /// changes bar and strips it from the visible message.
+    /// </summary>
+    public const string PlanReadyMarker = "<<PLAN_READY>>";
+
+    /// <summary>
+    /// Build the plan-mode instructions appended to the agent's system prompt for
+    /// the operator's chosen <see cref="PlanMode"/>. Returns "" for Off. All gated
+    /// modes tell the agent to investigate read-only, present a numbered plan that
+    /// ends with <see cref="PlanReadyMarker"/>, then stop until the operator
+    /// approves before making any changes.
+    /// </summary>
+    public static string PlanModeSuffix(PlanMode mode)
+    {
+        if (mode == PlanMode.Off) return "";
+
+        // Shared rules for every gated mode: what "a plan" means and how to hand it
+        // back for approval. The marker MUST be exact so the UI can detect it.
+        const string common =
+            "When you plan, first investigate read-only (read and search files - do NOT "
+            + "edit anything yet), then present a concise, numbered PLAN of exactly what "
+            + "you intend to change and why. Also record it with the task_tracker 'plan' "
+            + "command. End the plan message with the exact line " + PlanReadyMarker + " on "
+            + "its own line, then STOP and wait. Do NOT edit files, run state-changing "
+            + "commands, or perform git writes until the operator approves. The operator "
+            + "approves by clicking Approve or replying with something like 'approve', "
+            + "'go ahead', or 'yes' - treat any such reply as approval and carry out the "
+            + "plan, making the changes. If they ask for changes instead, revise the plan "
+            + "and present it again ending with " + PlanReadyMarker + ".";
+
+        return mode switch
+        {
+            PlanMode.Always =>
+                "PLAN MODE (Always on): Every task must start with a plan the operator "
+                + "approves before you make any changes. " + common,
+            PlanMode.Auto =>
+                "PLAN MODE (Auto): For any non-trivial task (multiple steps or files, "
+                + "refactors, deletions, or anything risky), plan first. For a tiny, "
+                + "obviously-safe task or a plain question, you may proceed without a "
+                + "plan. " + common,
+            PlanMode.Ask =>
+                "PLAN MODE (Ask): At the START of a new task, briefly ask the operator "
+                + "whether you should plan first or just proceed, and wait for their "
+                + "answer. If they want a plan (or the task is risky), plan first. If "
+                + "they say go ahead, proceed directly. " + common,
+            _ => ""
+        };
+    }
+
     public static string DefaultSettingsPath()
     {
         var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
@@ -204,7 +255,7 @@ public static class AgentSpecProvider
         ["caching_prompt"] = true,
         ["log_completions"] = false,
         ["log_completions_folder"] = "logs\\completions",
-        ["native_tool_calling"] = false,
+        ["native_tool_calling"] = true,
         ["reasoning_effort"] = "high",
         ["enable_encrypted_reasoning"] = true,
         ["prompt_cache_retention"] = "24h",
@@ -224,12 +275,14 @@ public static class AgentSpecProvider
     }
 
     /// <summary>
-    /// Read and return the agent spec as a mutable JsonNode. Forces non-native
-    /// tool calling (so local models do not leak tool syntax) and injects the
-    /// agentic anti-refusal system suffix. Pass the working directory so the
-    /// agent is told where it is operating.
+    /// Read and return the agent spec as a mutable JsonNode and inject the agentic
+    /// anti-refusal system suffix. Pass the working directory so the agent is told
+    /// where it is operating. Tool-calling mode is left to the saved spec / AutoTune
+    /// (which enables native calling for models that support it); we no longer force
+    /// the prompt-text fallback, which made capable models leak markup and loop.
     /// </summary>
-    public static JsonNode Load(string? workingDir = null, string? workspaceSnapshot = null, string? path = null)
+    public static JsonNode Load(string? workingDir = null, string? workspaceSnapshot = null,
+        string? path = null, PlanMode planMode = PlanMode.Off)
     {
         path ??= DefaultSettingsPath();
         if (!File.Exists(path))
@@ -241,21 +294,20 @@ public static class AgentSpecProvider
         var node = JsonNode.Parse(json)
             ?? throw new InvalidDataException("agent_settings.json is empty or invalid.");
 
-        ForceNonNative(node["llm"]);
-        ForceNonNative(node["condenser"]?["llm"]);
         ApplyAccuracySettings(node);
-        InjectAgentContext(node, workingDir, workspaceSnapshot);
+        InjectAgentContext(node, workingDir, workspaceSnapshot, planMode);
         return node;
     }
 
     /// <summary>Same as <see cref="Load"/> but builds the workspace snapshot first.</summary>
     public static async Task<JsonNode> LoadAsync(
-        string? workingDir = null, string? editorPath = null, string? path = null)
+        string? workingDir = null, string? editorPath = null, string? path = null,
+        PlanMode planMode = PlanMode.Off)
     {
         var snapshot = workingDir is null
             ? ""
             : await WorkspaceContextService.BuildAsync(workingDir, editorPath);
-        return Load(workingDir, string.IsNullOrWhiteSpace(snapshot) ? null : snapshot, path);
+        return Load(workingDir, string.IsNullOrWhiteSpace(snapshot) ? null : snapshot, path, planMode);
     }
 
     /// <summary>
@@ -296,13 +348,8 @@ public static class AgentSpecProvider
         File.WriteAllText(path, node.ToJsonString(opts));
     }
 
-    private static void ForceNonNative(JsonNode? llm)
-    {
-        if (llm is JsonObject obj)
-            obj["native_tool_calling"] = false;
-    }
-
-    private static void InjectAgentContext(JsonNode node, string? workingDir, string? workspaceSnapshot)
+    private static void InjectAgentContext(JsonNode node, string? workingDir,
+        string? workspaceSnapshot, PlanMode planMode = PlanMode.Off)
     {
         if (node is not JsonObject obj) return;
 
@@ -312,6 +359,10 @@ public static class AgentSpecProvider
         if (!string.IsNullOrWhiteSpace(workingDir))
             parts.Add($"Your current working directory is: {workingDir}");
         parts.Add(AgenticSuffix);
+
+        var planSuffix = PlanModeSuffix(planMode);
+        if (!string.IsNullOrEmpty(planSuffix))
+            parts.Add(planSuffix);
 
         obj["agent_context"] = new JsonObject
         {

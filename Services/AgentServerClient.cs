@@ -14,6 +14,13 @@ public sealed record AgentUpdate(ChatRole Role, string Header, string Text, bool
 /// <summary>Token/context usage snapshot from the server's stats stream.</summary>
 public sealed record UsageStats(long TotalTokens, long PerTurnTokens, long ContextWindow, double Cost);
 
+/// <summary>Operator approval mode translated to OpenHands confirmation policy.</summary>
+public enum AgentPermissionPolicy
+{
+    Ask,
+    AllowAll
+}
+
 /// <summary>
 /// Talks to the OpenHands agent-server: creates conversations over REST and
 /// streams events over a WebSocket. Raw server events are normalized into
@@ -143,6 +150,53 @@ public sealed class AgentServerClient : IDisposable
         {
             var text = await resp.Content.ReadAsStringAsync(ct);
             throw new InvalidOperationException($"Switch model failed ({(int)resp.StatusCode}): {text}");
+        }
+    }
+
+    /// <summary>
+    /// Configure OpenHands' built-in confirmation policy. Ask confirms HIGH and
+    /// UNKNOWN risk actions; AllowAll maps to NeverConfirm.
+    /// </summary>
+    public async Task SetConfirmationPolicyAsync(AgentPermissionPolicy policy, CancellationToken ct = default)
+    {
+        if (ConversationId is null)
+            throw new InvalidOperationException("No active conversation to configure.");
+
+        JsonObject policyNode = policy == AgentPermissionPolicy.AllowAll
+            ? new JsonObject { ["kind"] = "NeverConfirm" }
+            : new JsonObject
+            {
+                ["kind"] = "ConfirmRisky",
+                ["threshold"] = "HIGH",
+                ["confirm_unknown"] = true
+            };
+
+        var body = new JsonObject { ["policy"] = policyNode };
+        using var resp = await _http.PostAsJsonAsync(
+            $"{_baseUrl}/api/conversations/{ConversationId}/confirmation_policy", body, ct);
+        if (!resp.IsSuccessStatusCode)
+        {
+            var text = await resp.Content.ReadAsStringAsync(ct);
+            throw new InvalidOperationException(
+                $"Set permission policy failed ({(int)resp.StatusCode}): {text}");
+        }
+    }
+
+    /// <summary>Accept or reject the pending confirmed action(s).</summary>
+    public async Task RespondToConfirmationAsync(bool accept, string reason = "User rejected the action.",
+        CancellationToken ct = default)
+    {
+        if (ConversationId is null)
+            throw new InvalidOperationException("No active conversation to confirm.");
+
+        var body = new JsonObject { ["accept"] = accept, ["reason"] = reason };
+        using var resp = await _http.PostAsJsonAsync(
+            $"{_baseUrl}/api/conversations/{ConversationId}/events/respond_to_confirmation", body, ct);
+        if (!resp.IsSuccessStatusCode)
+        {
+            var text = await resp.Content.ReadAsStringAsync(ct);
+            throw new InvalidOperationException(
+                $"Permission response failed ({(int)resp.StatusCode}): {text}");
         }
     }
 

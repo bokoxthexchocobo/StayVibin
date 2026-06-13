@@ -34,6 +34,24 @@ public partial class MainWindow : Window
     private ChatItem? _streamingItem;
     private readonly System.Text.StringBuilder _streamRaw = new();   // raw stream before tool-syntax stripping
     private bool _streamStripMode;  // once tool markup is seen, re-strip the whole stream each delta
+    private bool _turnUsedTools;    // true once the current turn invokes a tool or receives an observation
+    private bool _turnAutoNudged;   // prevent infinite "continue and actually work" retries
+    private string _lastAssistantText = "";
+
+    // Counts consecutive tool-call schema validation failures (the model invents
+    // tool parameters that the tool does not accept). After a couple in a row we
+    // warn once per model that it is likely too weak to use the tools correctly.
+    private int _toolSchemaErrors;
+    private bool _weakModelWarned;
+
+    // Plan Mode: true while the agent has presented a plan and is waiting for the
+    // operator to approve before making changes. _lastAgentItem is the most recent
+    // assistant bubble, so we can strip the PLAN_READY marker out of it in place.
+    private bool _planAwaitingApproval;
+    private ChatItem? _lastAgentItem;
+    private bool _suppressPlanEvent;   // ignore the combo's SelectionChanged during init
+    private bool _permissionAwaitingApproval;
+    private bool _suppressPermissionEvent;
 
     // Messages typed while the agent is busy wait here and are sent one at a time
     // as each agent turn finishes (queueing is the default; Steer interjects now).
@@ -48,6 +66,7 @@ public partial class MainWindow : Window
     private string? _selectedModel;     // ollama tag, e.g. "qwen2.5-coder:14b"
     private bool _populatingModels;
     private readonly SemaphoreSlim _modelLoadLock = new(1, 1);   // serialize PopulateModelsAsync
+    private readonly HashSet<string> _modelAdviceShown = new(StringComparer.OrdinalIgnoreCase);
 
     public MainWindow()
     {
@@ -73,6 +92,15 @@ public partial class MainWindow : Window
         // Pre-session placeholder; refined per-model once tuned/started.
         _assumedContextWindow = _settings.BackendContextLength;
 
+        // Reflect the saved Plan Mode without firing the change handler (which saves
+        // and posts a chat note). Enum order matches the combo item order.
+        _suppressPlanEvent = true;
+        PlanModeCombo.SelectedIndex = (int)_settings.PlanMode;
+        _suppressPlanEvent = false;
+        _suppressPermissionEvent = true;
+        PermissionModeCombo.SelectedIndex = (int)_settings.PermissionMode;
+        _suppressPermissionEvent = false;
+
         AddSystem("Welcome. Pick a working folder, then press Start to launch the agent.");
         Closing += (_, _) => Cleanup();
         Loaded += OnWindowLoaded;
@@ -85,6 +113,21 @@ public partial class MainWindow : Window
         _ = PopulateModelsAsync();
         _ = UpdateRepoBadgeAsync();
         _ = RefreshTreeAsync();
+    }
+
+    /// <summary>
+    /// Surface a short, human-readable warning when the selected model is likely too
+    /// weak for agentic tool use. Shown once per model per app run to avoid spam.
+    /// </summary>
+    private async Task ShowModelFitnessAdviceAsync(string model)
+    {
+        if (string.IsNullOrWhiteSpace(model) || !_modelAdviceShown.Add(model)) return;
+
+        ModelInfo? info = _ollama is null ? null : await _ollama.GetModelInfoAsync(model);
+        var notice = ModelAdvisor.Assess(model, info);
+        if (notice is null) return;
+
+        AddSystem($"Model guidance ({notice.Severity}): {notice.Message}");
     }
 
     private async void OnWindowLoaded(object sender, RoutedEventArgs e)
@@ -136,6 +179,25 @@ public partial class MainWindow : Window
         await PopulateModelsAsync();
         AddSystem($"Configured Ollama with model {dlg.Model}. Press Start to begin.");
         return true;
+    }
+
+    /// <summary>
+    /// Verify the local Ollama server is reachable before starting a session. The
+    /// agent-server has no model backend without it, so we block Start and tell the
+    /// user how to fix it instead of failing deeper in the flow.
+    /// </summary>
+    private async Task<bool> EnsureOllamaRunningAsync()
+    {
+        if (_ollama is null) _ollama = new OllamaClient(_settings.OllamaUrl);
+
+        SetStatus("Checking Ollama...", AppDot.Connecting);
+        if (await _ollama.IsReachableAsync()) return true;
+
+        AddError($"Ollama is not reachable at {_settings.OllamaUrl}.\n"
+                 + "Start Ollama (run 'ollama serve', or launch the Ollama app) and make "
+                 + "sure at least one model is pulled, then press Start again. If Ollama "
+                 + "runs on a different host/port, update the URL in Settings.");
+        return false;
     }
 
     private int _backendContext;
@@ -214,9 +276,11 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
-    /// Fill the model dropdown from Ollama, preserving the currently selected model
-    /// even if it isn't installed locally, then refresh its capability strip.
-    /// Embedding-only models are listed but disabled (they can't chat).
+    /// Fill the model dropdown from Ollama's installed list and refresh the capability
+    /// strip. The installed list is authoritative: a configured model that is no longer
+    /// installed is not shown (the selection falls back to an installed model). The
+    /// configured model is only used as a fallback when Ollama returns nothing
+    /// (offline). Embedding-only models are listed but disabled (they can't chat).
     /// </summary>
     private async Task PopulateModelsAsync()
     {
@@ -257,9 +321,12 @@ public partial class MainWindow : Window
         {
             ModelCombo.Items.Clear();
 
+            // The installed list is authoritative when Ollama answered. Only fall back
+            // to the configured model when Ollama returned nothing (offline) so the
+            // dropdown still shows something - never inject a model that Ollama says is
+            // not installed (e.g. one the user just deleted), or it shows phantoms.
             var names = new List<string>(models);
-            if (_selectedModel is not null &&
-                !names.Contains(_selectedModel, StringComparer.OrdinalIgnoreCase))
+            if (names.Count == 0 && _selectedModel is not null)
                 names.Insert(0, _selectedModel);
 
             ModelEntry? toSelect = null;
@@ -279,6 +346,10 @@ public partial class MainWindow : Window
             // Prefer the configured model; otherwise the first model that can chat.
             toSelect ??= ModelCombo.Items.Cast<ModelEntry>().FirstOrDefault(e => e.IsSelectable);
             ModelCombo.SelectedItem = toSelect;
+
+            // Keep _selectedModel pointing at a model that actually exists, so the rest
+            // of the app (Start, capability strip, warm-up) never targets a deleted one.
+            if (toSelect is not null) _selectedModel = toSelect.Name;
 
             if (names.Count == 0)
                 AddSystem("No Ollama models detected - is Ollama running on this machine?");
@@ -313,6 +384,13 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>Open the VRAM-tiered model recommendation guide without cluttering the main UI.</summary>
+    private void OnModelRecommendations(object sender, RoutedEventArgs e)
+    {
+        var dlg = new ModelRecommendationsWindow { Owner = this };
+        dlg.ShowDialog();
+    }
+
     /// <summary>True for models that only do embeddings (no chat/completion).</summary>
     private static bool IsEmbeddingOnly(ModelInfo? info)
     {
@@ -345,6 +423,10 @@ public partial class MainWindow : Window
     private ModelInfo? _currentModelInfo;
     private int _capSeq;   // guards against out-of-order capability lookups
 
+    // Models we have already warned about for broken tool calling, so the chat
+    // warning fires once per model rather than on every re-selection.
+    private readonly HashSet<string> _toolWarned = new(StringComparer.OrdinalIgnoreCase);
+
     private bool ModelHasVision =>
         _currentModelInfo?.Capabilities?.Any(c => c.Equals("vision", StringComparison.OrdinalIgnoreCase)) ?? false;
 
@@ -367,6 +449,38 @@ public partial class MainWindow : Window
 
         _currentModelInfo = info;
         RenderCapabilities(info);
+
+        // Then verify the model can actually emit structured tool calls. Some models
+        // advertise a "tools" capability but return the call as plain text, which
+        // makes the agent silently do nothing - probe in the background and warn.
+        _ = VerifyToolCallingAsync(model, seq);
+    }
+
+    /// <summary>
+    /// Background check: if the model returns tool calls as text instead of real
+    /// tool_calls, append a warning badge to the capability strip and (once per
+    /// model) post a chat message pointing the user at a model that works.
+    /// </summary>
+    private async Task VerifyToolCallingAsync(string model, int seq)
+    {
+        if (_ollama is null) return;
+
+        var ok = await _ollama.ProbeToolCallingAsync(model);
+        if (seq != _capSeq) return;           // model changed while probing
+        if (ok != false) return;              // true (good) or null (unknown) -> stay quiet
+
+        CapabilityPanel.Children.Add(MakeCapBadge("\u26A0", "no tool calls",
+            $"{model} does not return structured tool calls - it writes them as plain "
+            + "text, so the agent cannot act and appears to do nothing. Pick a model "
+            + "built for tools (e.g. gpt-oss, qwen3, qwen3.5) for agentic work.",
+            warn: true));
+
+        if (_toolWarned.Add(model))
+            AddError($"Heads up: '{model}' can't use tools properly on Ollama - it "
+                     + "returns tool calls as plain text, so the agent will appear to "
+                     + "stall or print raw JSON instead of running commands. Switch the "
+                     + "model dropdown to a tool-capable model such as gpt-oss:20b, "
+                     + "qwen3.5, or qwen3:14b for real agentic work.");
     }
 
     private void RenderCapabilities(ModelInfo? info)
@@ -405,7 +519,7 @@ public partial class MainWindow : Window
     }
 
     /// <summary>Build one rounded icon+label badge with an explanatory tooltip.</summary>
-    private Border MakeCapBadge(string icon, string label, string tip, bool dim = false)
+    private Border MakeCapBadge(string icon, string label, string tip, bool dim = false, bool warn = false)
     {
         var row = new StackPanel { Orientation = Orientation.Horizontal };
         row.Children.Add(new TextBlock
@@ -421,13 +535,13 @@ public partial class MainWindow : Window
             FontSize = 11,
             Margin = new Thickness(5, 0, 0, 0),
             VerticalAlignment = VerticalAlignment.Center,
-            Foreground = (Brush)FindResource(dim ? "TextDim" : "Text")
+            Foreground = (Brush)FindResource(warn ? "Warn" : dim ? "TextDim" : "Text")
         });
 
         var badge = new Border
         {
             Background = (Brush)FindResource("PanelAlt"),
-            BorderBrush = (Brush)FindResource("Border"),
+            BorderBrush = (Brush)FindResource(warn ? "Warn" : "Border"),
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(6),
             Padding = new Thickness(7, 2, 8, 2),
@@ -636,6 +750,15 @@ public partial class MainWindow : Window
                 return;
             }
 
+            // Ollama must be up before we launch anything: the agent-server is useless
+            // without a model backend, and starting it would only fail later.
+            if (!await EnsureOllamaRunningAsync())
+            {
+                SetStatus("Ollama not running", AppDot.Down);
+                SetSessionActive(false);
+                return;
+            }
+
             if (!await EnsureBackendInstalledAsync())
             {
                 SetStatus("OpenHands not installed", AppDot.Down);
@@ -643,12 +766,18 @@ public partial class MainWindow : Window
                 return;
             }
 
-            JsonNode spec = await AgentSpecProvider.LoadAsync(_workingDir, _editorPath);
+            JsonNode spec = await AgentSpecProvider.LoadAsync(_workingDir, _editorPath, planMode: _settings.PlanMode);
             _llmTemplate ??= JsonNode.Parse(spec["llm"]!.ToJsonString());
             if (_selectedModel is not null) ApplyModel(spec, _selectedModel);
 
             if (_settings.AutoTune)
                 await AutoTuneSpecAsync(spec);
+            else
+                // AutoTune off still needs correct tool-calling mode, otherwise the
+                // saved spec's native_tool_calling=false breaks tool-capable models.
+                await ApplyNativeToolCallingAsync(spec);
+            if (_selectedModel is not null)
+                _ = ShowModelFitnessAdviceAsync(_selectedModel);
 
             // Respawn the server if the desired context size differs from what the
             // current backend was built with. OLLAMA_CONTEXT_LENGTH is applied at
@@ -667,21 +796,7 @@ public partial class MainWindow : Window
                 return;
             }
 
-            SetStatus("Creating conversation...", AppDot.Connecting);
-            _client = new AgentServerClient(_backend.BaseUrl);
-            _client.Update += OnAgentUpdate;
-            _client.StatusChanged += OnServerStatus;
-            _client.StatsUpdated += OnStats;
-            _client.CompactingStarted += OnCompactingStarted;
-            _client.Compacted += OnCompacted;
-            _client.Disconnected += OnDisconnected;
-
-            await _client.StartConversationAsync(spec, _workingDir, _settings.MaxIterations);
-            await _client.ConnectAsync();
-
-            SetSessionActive(true);
-            RefreshStatsDisplay();   // show configured runtime window before stats arrive
-            SetStatus("Ready", AppDot.Idle);
+            await ConnectConversationAsync(spec);
             InputBox.Focus();
             AddSystem($"Connected. Working in {_workingDir}");
             AddSystem(DescribeAutoCompact(spec));
@@ -692,6 +807,98 @@ public partial class MainWindow : Window
         {
             SetStatus("Error", AppDot.Down);
             AddError(ex.Message);
+            await DisposeClientAsync();
+            SetSessionActive(false);
+        }
+        finally
+        {
+            SetBusy(false);
+        }
+    }
+
+    /// <summary>
+    /// Create a fresh conversation from the given spec, wire up the event client and
+    /// open the socket. Shared by Start and by live model switches (which recreate the
+    /// conversation, since the server's switch_llm cannot reliably change a running
+    /// conversation's model - see <see cref="RestartConversationWithModelAsync"/>).
+    /// </summary>
+    private async Task ConnectConversationAsync(JsonNode spec)
+    {
+        SetStatus("Creating conversation...", AppDot.Connecting);
+        _client = new AgentServerClient(_backend.BaseUrl);
+        _client.Update += OnAgentUpdate;
+        _client.StatusChanged += OnServerStatus;
+        _client.StatsUpdated += OnStats;
+        _client.CompactingStarted += OnCompactingStarted;
+        _client.Compacted += OnCompacted;
+        _client.Disconnected += OnDisconnected;
+
+        await _client.StartConversationAsync(spec, _workingDir, _settings.MaxIterations);
+        await _client.SetConfirmationPolicyAsync(ToAgentPermissionPolicy(_settings.PermissionMode));
+        await _client.ConnectAsync();
+
+        SetSessionActive(true);
+        RefreshStatsDisplay();   // show configured runtime window before stats arrive
+
+        // Pre-load the model in the background so the user's first message isn't stuck
+        // behind a cold load. Warming at the resolved runtime context avoids a later
+        // reload when the agent's first request uses that same num_ctx.
+        _ = WarmSelectedModelAsync();
+    }
+
+    /// <summary>
+    /// Background model warm-up after connecting. Shows a "Loading model" status while
+    /// Ollama pulls the weights into memory, then flips to Ready. Best-effort: never
+    /// blocks the session or surfaces an error if it fails.
+    /// </summary>
+    private async Task WarmSelectedModelAsync()
+    {
+        var model = _selectedModel;
+        if (_ollama is null || string.IsNullOrWhiteSpace(model))
+        {
+            SetStatus("Ready", AppDot.Idle);
+            return;
+        }
+
+        SetStatus("Loading model (first run can take a minute)...", AppDot.Connecting);
+        try
+        {
+            await _ollama.WarmAsync(model, (int)_assumedContextWindow);
+        }
+        catch { /* best-effort */ }
+
+        // Only claim Ready if the session is still live and the agent did not start a
+        // turn while we were warming (otherwise we'd stomp the "Agent working" status).
+        if (_client is not null && !_agentRunning) SetStatus("Ready", AppDot.Idle);
+    }
+
+    /// <summary>
+    /// Switch the live conversation to a new model by recreating it. The server's
+    /// switch_llm endpoint is "first-write-wins" per usage_id and only swaps the
+    /// agent (never the condenser), so on an existing conversation it silently keeps
+    /// the original model. Tearing down and recreating with the new model baked into
+    /// a fresh spec is the only reliable way to actually change models mid-session.
+    /// </summary>
+    private async Task RestartConversationWithModelAsync(string model)
+    {
+        SetBusy(true);
+        try
+        {
+            await DisposeClientAsync();   // drop the stale conversation + its registry
+
+            var spec = await AgentSpecProvider.LoadAsync(_workingDir, _editorPath, planMode: _settings.PlanMode);
+            ApplyModel(spec, model);
+            if (_settings.AutoTune) await AutoTuneSpecAsync(spec);
+            else await ApplyNativeToolCallingAsync(spec);   // keep tool calling correct
+
+            await ConnectConversationAsync(spec);
+            AddSystem($"Switched model to {model} - started a fresh conversation "
+                      + "(history was reset because the model changed).");
+        }
+        catch (Exception ex)
+        {
+            SetStatus("Error", AppDot.Down);
+            AddError($"Could not switch model: {ex.Message}");
             await DisposeClientAsync();
             SetSessionActive(false);
         }
@@ -788,7 +995,9 @@ public partial class MainWindow : Window
 
     /// <summary>
     /// Remember the chosen model and refresh its capability strip. If a session is
-    /// already live, hot-swap the conversation's LLM (and re-tune it) on the fly.
+    /// already live, recreate the conversation on the new model (the server cannot
+    /// reliably swap a running conversation's model - see
+    /// <see cref="RestartConversationWithModelAsync"/>).
     /// </summary>
     private async void OnModelSelected(object sender, SelectionChangedEventArgs e)
     {
@@ -797,29 +1006,19 @@ public partial class MainWindow : Window
         var model = entry.Name;
         _selectedModel = model;
 
+        // New model gets a fresh chance to prove it can drive the tools.
+        _toolSchemaErrors = 0;
+        _weakModelWarned = false;
+
         _ = UpdateCapabilitiesAsync(model);
+        _ = ShowModelFitnessAdviceAsync(model);
 
-        // Before Start the choice is just remembered; once connected we hot-swap.
-        if (_client is null || _llmTemplate is null) return;
+        // Before Start the choice is just remembered; it is applied when the
+        // conversation is created. Once connected, recreate the conversation with the
+        // new model (the server cannot reliably swap a live conversation's model).
+        if (_client is null) return;
 
-        try
-        {
-            var llm = JsonNode.Parse(_llmTemplate.ToJsonString())!;
-            llm["model"] = ToModelField(model);
-            llm["native_tool_calling"] = false;
-            if (_settings.AutoTune)
-            {
-                var (rec, _) = await RecommendAsync(model);
-                ApplyTuningToLlm(llm, rec);
-                _assumedContextWindow = rec.ContextLength;
-            }
-            await _client.SwitchLlmAsync(llm);
-            AddSystem($"Switched model to {model}");
-        }
-        catch (Exception ex)
-        {
-            AddError($"Could not switch model: {ex.Message}");
-        }
+        await RestartConversationWithModelAsync(model);
     }
 
     // ---- attachments --------------------------------------------------------
@@ -1056,12 +1255,42 @@ public partial class MainWindow : Window
                   + $"context {rec.ContextLength:N0} tokens, reasoning {rec.ReasoningEffort}.");
     }
 
+    /// <summary>
+    /// Resolve native tool calling for the spec independently of AutoTune. The saved
+    /// agent_settings.json can persist native_tool_calling=false (the prompt-text
+    /// fallback), which makes tool-capable local models leak '&lt;function=...&gt;'
+    /// markup, loop, and stall doing nothing. Tool-calling mode is a correctness
+    /// setting, not a tuning preference, so we always set it from the model's real
+    /// capabilities - including when AutoTune is off, which otherwise skips
+    /// <see cref="AutoTuneSpecAsync"/> entirely and would leave the broken false.
+    /// </summary>
+    private async Task ApplyNativeToolCallingAsync(JsonNode spec)
+    {
+        var model = _selectedModel ?? StripProvider(AgentSpecProvider.DescribeModel(spec));
+        if (string.IsNullOrWhiteSpace(model)) return;
+
+        ModelInfo? info = _ollama is null ? null : await _ollama.GetModelInfoAsync(model);
+        bool native = ModelTuning.SupportsTools(info);
+        SetNativeToolCalling(spec["llm"], native);
+        SetNativeToolCalling(spec["condenser"]?["llm"], native);
+    }
+
+    private static void SetNativeToolCalling(JsonNode? llm, bool native)
+    {
+        if (llm is JsonObject o) o["native_tool_calling"] = native;
+    }
+
     private static void ApplyTuningToLlm(JsonNode? llm, TuneResult rec)
     {
         if (llm is not JsonObject o) return;
         o["temperature"] = rec.Temperature;
         o["reasoning_effort"] = rec.ReasoningEffort;
         o["max_input_tokens"] = rec.ContextLength;
+
+        // Use Ollama's real tool API when the model supports it. The prompt-text
+        // fallback (native off) is what makes capable models leak '<function=...>'
+        // markup, loop, and tell the user to run commands instead of acting.
+        o["native_tool_calling"] = rec.NativeToolCalling;
 
         // Stream agent replies token-by-token; keep condenser non-streaming.
         if (o["usage_id"]?.GetValue<string>() == "agent")
@@ -1129,6 +1358,15 @@ public partial class MainWindow : Window
         bool hasAttachments = _attachments.Count > 0;
         if ((text.Length == 0 && !hasAttachments) || _client is null || _busy) return;
 
+        // A typed message is the operator's response to a pending plan (an approval
+        // word or a change request), so dismiss the approval bar - the agent reads
+        // the message and acts on it.
+        if (_planAwaitingApproval)
+        {
+            _planAwaitingApproval = false;
+            SetPlanApprovalVisible(false);
+        }
+
         var shown = ComposeShown(text, hasAttachments);
         InputBox.Clear();
 
@@ -1147,6 +1385,7 @@ public partial class MainWindow : Window
 
         AddUser(shown);
         _streamingItem = null;
+        ResetTurnTracking();
         SetRunning(true);
 
         try
@@ -1202,6 +1441,7 @@ public partial class MainWindow : Window
             // Peek first so a failed send does not drop the message from the queue.
             var msg = _queue.Peek();
             _streamingItem = null;
+            ResetTurnTracking();
             SetRunning(true);
             try
             {
@@ -1246,6 +1486,15 @@ public partial class MainWindow : Window
             || tail.IndexOf("<parameter=", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
+    /// <summary>Start a fresh accounting window for the next agent turn.</summary>
+    private void ResetTurnTracking()
+    {
+        _turnUsedTools = false;
+        _turnAutoNudged = false;
+        _lastAssistantText = "";
+        _lastAgentItem = null;
+    }
+
     private void OnAgentUpdate(AgentUpdate u)
         => Dispatcher.Invoke(() => ApplyUpdate(u));
 
@@ -1256,6 +1505,7 @@ public partial class MainWindow : Window
             if (_streamingItem is null)
             {
                 _streamingItem = AddItem(ChatRole.Agent, u.Header, "");
+                _lastAgentItem = _streamingItem;
                 _streamRaw.Clear();
                 _streamStripMode = false;
             }
@@ -1286,20 +1536,68 @@ public partial class MainWindow : Window
             if (_streamingItem is not null)
             {
                 _streamingItem.Text = u.Text;
+                _lastAgentItem = _streamingItem;
                 _streamingItem = null;
             }
             else
             {
-                AddItem(ChatRole.Agent, u.Header, u.Text);
+                _lastAgentItem = AddItem(ChatRole.Agent, u.Header, u.Text);
             }
+            _lastAssistantText = u.Text;
             ScrollToBottom();
             return;
         }
 
         // Thought / Tool / Observation / Error all break the current stream.
         _streamingItem = null;
+        if (u.Role is ChatRole.Tool or ChatRole.Observation)
+            _turnUsedTools = true;
+        // A successful observation means the model used a tool correctly, so reset
+        // the bad-tool-call streak.
+        if (u.Role is ChatRole.Observation)
+            _toolSchemaErrors = 0;
+
         AddItem(u.Role, u.Header, u.Text);
+
+        if (u.Role is ChatRole.Error)
+            NoteToolSchemaError(u.Text);
+
         ScrollToBottom();
+    }
+
+    /// <summary>
+    /// Detect the "model invented tool parameters" failure (pydantic rejects the
+    /// tool call with extra_forbidden / validation errors) and, after it repeats,
+    /// tell the user plainly that the model is likely too weak to drive the tools.
+    /// </summary>
+    private void NoteToolSchemaError(string errorText)
+    {
+        if (!LooksLikeToolSchemaError(errorText))
+            return;
+
+        _toolSchemaErrors++;
+        if (_weakModelWarned || _toolSchemaErrors < 2)
+            return;
+
+        _weakModelWarned = true;
+        var model = _selectedModel ?? "This model";
+        AddSystem(
+            $"Heads up: {model} keeps calling its tools with parameters they do not "
+            + "accept (a tool schema validation error). That almost always means the "
+            + "model is too small to use these tools correctly - it is not a bug in "
+            + "StayVibin or your setup. Switch to a larger model with strong tool "
+            + "support (for example qwen3:14b or gpt-oss:20b) for reliable results.");
+    }
+
+    /// <summary>True for tool-call schema validation errors (wrong/extra parameters).</summary>
+    private static bool LooksLikeToolSchemaError(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return false;
+        var s = text.ToLowerInvariant();
+        return s.Contains("extra_forbidden")
+            || s.Contains("extra inputs are not permitted")
+            || s.Contains("validation error")
+            || s.Contains("error validating tool");
     }
 
     private void OnServerStatus(string status)
@@ -1307,21 +1605,298 @@ public partial class MainWindow : Window
         {
             var s = status.ToLowerInvariant();
             bool running = s.Contains("running");
+            bool waitingForPermission = s.Contains("waiting_for_confirmation");
             bool falling = _agentRunning && !running;   // a turn just finished
             SetRunning(running);
-            if (!running)
+            if (waitingForPermission)
+            {
+                SetStatus("Waiting for permission", AppDot.Connecting);
+                EnterPermissionApproval();
+            }
+            else if (!running)
             {
                 SetStatus(Capitalize(status), AppDot.Idle);
                 if (falling)
                 {
-                    _ = UpdateRepoBadgeAsync();   // the agent may have committed/branched
-                    _ = RefreshTreeAsync();       // surface any files the agent changed
-                    _ = FlushQueueAsync();        // send the next queued message, if any
+                    _ = HandleTurnFinishedAsync();
                 }
             }
             else
                 SetStatus("Agent working...", AppDot.Working);
         });
+
+    /// <summary>
+    /// Post-turn maintenance plus a guard for a common weak local-model failure:
+    /// the assistant says "I'll inspect..." then finishes without invoking a tool.
+    /// In that case, send one internal nudge so the app keeps working instead of
+    /// leaving the user with a stopped "I'll do it" promise.
+    /// </summary>
+    private async Task HandleTurnFinishedAsync()
+    {
+        _ = UpdateRepoBadgeAsync();   // the agent may have committed/branched
+        _ = RefreshTreeAsync();       // surface any files the agent changed
+
+        // A plan awaiting approval takes priority: show the Approve bar and stop
+        // here (do not auto-continue or flush the queue while we wait on the user).
+        if (TryEnterPlanApproval())
+            return;
+
+        if (ShouldAutoContinueWork())
+        {
+            await AutoContinueWorkAsync();
+            return;
+        }
+
+        await FlushQueueAsync();      // send the next queued message, if any
+    }
+
+    /// <summary>
+    /// If Plan Mode is active and the agent ended its turn with the PLAN_READY
+    /// marker, strip the marker from the bubble, reveal the Approve/Request-changes
+    /// bar, and report that we are now waiting on the operator.
+    /// </summary>
+    private bool TryEnterPlanApproval()
+    {
+        if (_settings.PlanMode == PlanMode.Off) return false;
+
+        var item = _lastAgentItem;
+        var text = item?.Text ?? _lastAssistantText;
+        if (string.IsNullOrEmpty(text)
+            || !text.Contains(AgentSpecProvider.PlanReadyMarker, StringComparison.Ordinal))
+            return false;
+
+        if (item is not null)
+            item.Text = StripPlanMarker(item.Text);
+
+        _planAwaitingApproval = true;
+        SetPlanApprovalVisible(true);
+        return true;
+    }
+
+    private static string StripPlanMarker(string text)
+        => text.Replace(AgentSpecProvider.PlanReadyMarker, "", StringComparison.Ordinal).TrimEnd();
+
+    private void SetPlanApprovalVisible(bool visible)
+        => PlanApprovalBar.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+
+    private static AgentPermissionPolicy ToAgentPermissionPolicy(PermissionMode mode)
+        => mode == PermissionMode.AllowAll
+            ? AgentPermissionPolicy.AllowAll
+            : AgentPermissionPolicy.Ask;
+
+    private void EnterPermissionApproval()
+    {
+        if (_settings.PermissionMode == PermissionMode.AllowAll) return;
+        _permissionAwaitingApproval = true;
+        PermissionText.Text =
+            "The agent wants to perform an action OpenHands marked as risky or unknown. "
+            + "Review the last tool/action above, then allow it once, deny it, or switch to Allow all.";
+        PermissionApprovalBar.Visibility = Visibility.Visible;
+    }
+
+    private void ClearPermissionApproval()
+    {
+        _permissionAwaitingApproval = false;
+        PermissionApprovalBar.Visibility = Visibility.Collapsed;
+    }
+
+    private async void OnPermissionModeChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_suppressPermissionEvent) return;
+
+        _settings.PermissionMode = PermissionModeCombo.SelectedIndex == 1
+            ? PermissionMode.AllowAll
+            : PermissionMode.Ask;
+        _settings.Save();
+
+        if (_client is not null)
+        {
+            try
+            {
+                await _client.SetConfirmationPolicyAsync(ToAgentPermissionPolicy(_settings.PermissionMode));
+                AddSystem(_settings.PermissionMode == PermissionMode.AllowAll
+                    ? "Permission mode set to Allow all. The agent can proceed without approval prompts for this session."
+                    : "Permission mode set to Ask. Risky or unknown actions will pause for approval.");
+            }
+            catch (Exception ex)
+            {
+                AddError($"Could not update permission mode: {ex.Message}");
+            }
+        }
+    }
+
+    private async void OnPermissionAllow(object sender, RoutedEventArgs e)
+    {
+        if (!_permissionAwaitingApproval || _client is null) return;
+
+        ClearPermissionApproval();
+        SetRunning(true);
+        try
+        {
+            await _client.RespondToConfirmationAsync(true);
+        }
+        catch (Exception ex)
+        {
+            AddError($"Could not allow action: {ex.Message}");
+            SetRunning(false);
+        }
+    }
+
+    private async void OnPermissionDeny(object sender, RoutedEventArgs e)
+    {
+        if (!_permissionAwaitingApproval || _client is null) return;
+
+        ClearPermissionApproval();
+        SetRunning(true);
+        try
+        {
+            await _client.RespondToConfirmationAsync(false, "Operator denied this action.");
+        }
+        catch (Exception ex)
+        {
+            AddError($"Could not deny action: {ex.Message}");
+            SetRunning(false);
+        }
+    }
+
+    private async void OnPermissionAllowAll(object sender, RoutedEventArgs e)
+    {
+        if (_client is null) return;
+
+        _settings.PermissionMode = PermissionMode.AllowAll;
+        _settings.Save();
+        _suppressPermissionEvent = true;
+        PermissionModeCombo.SelectedIndex = 1;
+        _suppressPermissionEvent = false;
+
+        try
+        {
+            await _client.SetConfirmationPolicyAsync(AgentPermissionPolicy.AllowAll);
+            if (_permissionAwaitingApproval)
+            {
+                ClearPermissionApproval();
+                SetRunning(true);
+                await _client.RespondToConfirmationAsync(true);
+            }
+            AddSystem("Permission mode set to Allow all. The agent can proceed without approval prompts.");
+        }
+        catch (Exception ex)
+        {
+            AddError($"Could not allow all actions: {ex.Message}");
+            SetRunning(false);
+        }
+    }
+
+    /// <summary>Operator changed the Plan Mode selector: persist it and note when it applies.</summary>
+    private void OnPlanModeChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_suppressPlanEvent) return;
+
+        _settings.PlanMode = (PlanMode)PlanModeCombo.SelectedIndex;
+        _settings.Save();
+
+        // Turning planning off clears any pending approval prompt.
+        if (_settings.PlanMode == PlanMode.Off && _planAwaitingApproval)
+        {
+            _planAwaitingApproval = false;
+            SetPlanApprovalVisible(false);
+        }
+
+        // The mode is baked into the agent's system prompt at conversation creation,
+        // so a live session keeps its current behavior until the next fresh start.
+        if (_client is not null)
+            AddSystem($"Plan Mode set to {_settings.PlanMode}. It takes effect the next "
+                      + "time a conversation starts (press Start, or switch model).");
+    }
+
+    /// <summary>Approve the pending plan: tell the agent to carry it out now.</summary>
+    private async void OnPlanApprove(object sender, RoutedEventArgs e)
+    {
+        if (!_planAwaitingApproval || _client is null) return;
+
+        _planAwaitingApproval = false;
+        SetPlanApprovalVisible(false);
+        AddItem(ChatRole.User, "You", "Approved - proceed with the plan.");
+        SetRunning(true);
+        try
+        {
+            await _client.SendUserMessageAsync(
+                "Approved. Carry out the plan now and make the changes. Do not stop to "
+                + "ask again unless you hit something genuinely risky or destructive.");
+        }
+        catch (Exception ex)
+        {
+            AddError($"Failed to approve plan: {ex.Message}");
+            SetRunning(false);
+        }
+    }
+
+    /// <summary>Reject the pending plan and let the operator type what to change.</summary>
+    private void OnPlanDeny(object sender, RoutedEventArgs e)
+    {
+        if (!_planAwaitingApproval) return;
+
+        _planAwaitingApproval = false;
+        SetPlanApprovalVisible(false);
+        AddSystem("Plan declined. Tell the agent what to change, then press Send.");
+        InputBox.Focus();
+    }
+
+    private bool ShouldAutoContinueWork()
+    {
+        if (_client is null || _queue.Count > 0 || _turnUsedTools || _turnAutoNudged
+            || _planAwaitingApproval)
+            return false;
+
+        var text = (_lastAssistantText.Length > 0
+            ? _lastAssistantText
+            : _streamingItem?.Text ?? "").Trim();
+        if (text.Length == 0) return false;
+
+        return LooksLikeStoppedPromise(text);
+    }
+
+    /// <summary>
+    /// Heuristic for "future-tense work promise" responses. We keep it narrow so
+    /// normal answers do not get continued, and only use it when no tools ran.
+    /// </summary>
+    private static bool LooksLikeStoppedPromise(string text)
+    {
+        var s = text.ToLowerInvariant();
+        string[] promises =
+        [
+            "i'll start", "i will start", "i'll begin", "i will begin",
+            "i'll examine", "i will examine", "i'll review", "i will review",
+            "i'll look", "i will look", "i'll check", "i will check",
+            "next, i'll", "next i will", "then i'll", "then i will",
+            "if i find anything", "i'll provide feedback", "i will provide feedback",
+            "let me know if there's anything specific", "let me know if there is anything specific"
+        ];
+        return promises.Any(p => s.Contains(p, StringComparison.Ordinal));
+    }
+
+    private async Task AutoContinueWorkAsync()
+    {
+        if (_client is null) return;
+
+        _turnAutoNudged = true;
+        AddSystem("The assistant stopped after saying it would work, so StayVibin is continuing the turn automatically.");
+        SetRunning(true);
+        try
+        {
+            const string nudge =
+                "Continue now and actually perform the work with your tools. Do not describe a plan "
+                + "or ask me what to focus on. Start by inspecting the repository, running commands, "
+                + "and reporting concrete findings from real files.";
+            await _client.SendUserMessageAsync(nudge);
+        }
+        catch (Exception ex)
+        {
+            AddError($"Failed to continue automatically: {ex.Message}");
+            SetRunning(false);
+            await FlushQueueAsync();
+        }
+    }
 
     private void OnDisconnected(string reason)
         => Dispatcher.Invoke(() =>
@@ -1521,6 +2096,10 @@ public partial class MainWindow : Window
     private void SetBusy(bool busy)
     {
         _busy = busy;
+        // Gate the model dropdown so a switch can't start a second conversation
+        // recreate while a Start/Stop/switch is already in flight (which would leak
+        // the in-progress client and its event subscriptions).
+        ModelCombo.IsEnabled = !busy;
     }
 
     /// <summary>Toggle whole-session UI (Start vs Stop, input availability, stats).</summary>
@@ -1528,7 +2107,7 @@ public partial class MainWindow : Window
     {
         if (active)
         {
-            StartButton.Content = "Stop";
+            StartButtonText.Text = "Stop";
             StartButton.Style = (Style)FindResource("DangerButton");
             StartButton.IsEnabled = true;
             WorkDirButton.IsEnabled = false;
@@ -1539,7 +2118,7 @@ public partial class MainWindow : Window
         }
         else
         {
-            StartButton.Content = "Start";
+            StartButtonText.Text = "Start";
             StartButton.Style = (Style)FindResource("AccentButton");
             StartButton.IsEnabled = true;
             WorkDirButton.IsEnabled = true;
@@ -1554,6 +2133,9 @@ public partial class MainWindow : Window
             _queue.Clear();
             UpdateQueueIndicator();
             _agentRunning = false;
+            _planAwaitingApproval = false;
+            SetPlanApprovalVisible(false);
+            ClearPermissionApproval();
             SetActivity(false);
             ResetStatsDisplay();
         }
@@ -1576,8 +2158,8 @@ public partial class MainWindow : Window
     private bool _activityOn;
 
     /// <summary>
-    /// Show/animate the "agent working" cues: the sliding accent line under the
-    /// header and the pulsing status dot. Guarded so repeated status ticks don't
+    /// Show/animate the "agent working" cues: the spinner inside the Start/Stop
+    /// button and the pulsing status dot. Guarded so repeated status ticks don't
     /// restart the animations.
     /// </summary>
     private void SetActivity(bool on)
@@ -1585,19 +2167,19 @@ public partial class MainWindow : Window
         if (on == _activityOn) return;
         _activityOn = on;
 
-        var slide = (Storyboard)Resources["ActivitySlideSb"];
+        var spin = (Storyboard)Resources["ButtonSpinSb"];
         var pulse = (Storyboard)Resources["DotPulseSb"];
         if (on)
         {
-            ActivityBar.Visibility = Visibility.Visible;
-            slide.Begin(this, true);
+            ButtonSpinner.Visibility = Visibility.Visible;
+            spin.Begin(this, true);
             pulse.Begin(this, true);
         }
         else
         {
-            slide.Stop(this);
+            spin.Stop(this);
             pulse.Stop(this);
-            ActivityBar.Visibility = Visibility.Collapsed;
+            ButtonSpinner.Visibility = Visibility.Collapsed;
             StatusDot.Opacity = 1.0;   // restore after the pulse leaves it dimmed
         }
     }

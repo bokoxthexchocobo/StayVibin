@@ -21,13 +21,42 @@ public sealed class OllamaClient : IDisposable
     private readonly string _baseUrl;
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(4) };
 
+    // Separate long-lived client for slow operations (tool-calling probe, warm-up)
+    // that can take a minute+ while Ollama loads a model. Reused rather than created
+    // per call to avoid socket churn / port exhaustion. Per-call deadlines are
+    // applied with a linked CancellationTokenSource where a tighter bound is wanted.
+    private readonly HttpClient _opHttp = new() { Timeout = TimeSpan.FromSeconds(180) };
+
     // Only successful lookups are stored; a missing entry means "not fetched yet".
     private readonly ConcurrentDictionary<string, ModelInfo> _infoCache =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    // Tool-calling probe results: true = the model emits structured tool_calls,
+    // false = it only writes the call as plain text. Failed probes are not cached.
+    private readonly ConcurrentDictionary<string, bool> _toolProbeCache =
         new(StringComparer.OrdinalIgnoreCase);
 
     public OllamaClient(string baseUrl = "http://localhost:11434")
     {
         _baseUrl = baseUrl.TrimEnd('/');
+    }
+
+    /// <summary>
+    /// True if the Ollama HTTP API is reachable (process running and serving). Hits
+    /// the lightweight root endpoint and treats any HTTP response as "up"; only a
+    /// connection failure/timeout counts as "down".
+    /// </summary>
+    public async Task<bool> IsReachableAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            using var resp = await _http.GetAsync($"{_baseUrl}/api/version", ct);
+            return true;   // any response means the server answered
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     /// <summary>Return installed model names (e.g. "qwen2.5-coder:14b"), or empty on failure.</summary>
@@ -127,8 +156,104 @@ public sealed class OllamaClient : IDisposable
         }
     }
 
-    /// <summary>Forget cached metadata so the next lookup re-queries Ollama (used by Refresh).</summary>
-    public void ClearCache() => _infoCache.Clear();
+    /// <summary>
+    /// Probe whether a model returns STRUCTURED tool calls. Some Ollama models
+    /// (notably qwen2.5-coder) advertise a "tools" capability but emit the call as
+    /// plain-text JSON in message.content instead of message.tool_calls. OpenHands
+    /// cannot act on that, so the agent silently "does nothing" and the raw JSON
+    /// shows up as gibberish in chat. We send one tiny tools request and report
+    /// whether the model put the call where it belongs. Result is cached per model.
+    /// Returns null when the probe could not run (Ollama offline / timeout) so the
+    /// caller can stay quiet rather than warn on a false negative.
+    /// </summary>
+    public async Task<bool?> ProbeToolCallingAsync(string model, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(model)) return null;
+        if (_toolProbeCache.TryGetValue(model, out var cached)) return cached;
 
-    public void Dispose() => _http.Dispose();
+        // The model may have to load first. Allow up to 90s for this probe via a
+        // linked token, on the shared long-lived client.
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(TimeSpan.FromSeconds(90));
+        var pct = timeoutCts.Token;
+
+        // Minimal request: one tool plus a prompt that should trigger it. We only
+        // care about WHERE the call lands (tool_calls vs content), not the result.
+        const string payload =
+            "{\"model\":__MODEL__,\"stream\":false,\"options\":{\"temperature\":0}," +
+            "\"messages\":[{\"role\":\"user\",\"content\":" +
+            "\"List files in the current directory using the run_terminal tool.\"}]," +
+            "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"run_terminal\"," +
+            "\"description\":\"Run a shell command\",\"parameters\":{\"type\":\"object\"," +
+            "\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"]}}}]}";
+        var json = payload.Replace("__MODEL__", JsonSerializer.Serialize(model));
+
+        try
+        {
+            using var req = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/api/chat")
+            {
+                Content = new StringContent(json, System.Text.Encoding.UTF8, "application/json")
+            };
+            using var resp = await _opHttp.SendAsync(req, pct);
+            if (!resp.IsSuccessStatusCode) return null;
+
+            using var stream = await resp.Content.ReadAsStreamAsync(pct);
+            using var doc = await JsonDocument.ParseAsync(stream, cancellationToken: pct);
+
+            bool structured =
+                doc.RootElement.TryGetProperty("message", out var msg)
+                && msg.TryGetProperty("tool_calls", out var tc)
+                && tc.ValueKind == JsonValueKind.Array
+                && tc.GetArrayLength() > 0;
+
+            _toolProbeCache[model] = structured;
+            return structured;
+        }
+        catch
+        {
+            return null;   // transient - don't cache, allow a later retry
+        }
+    }
+
+    /// <summary>
+    /// Pre-load a model into memory at a specific context size so the first real
+    /// request does not pay the cold-load cost (which for a 14-20B model at a large
+    /// num_ctx can be a minute or more). Loading at the SAME num_ctx the session
+    /// will use avoids a second reload - Ollama re-loads the model when num_ctx
+    /// changes. keep_alive holds it in memory between requests. Best-effort: any
+    /// failure is swallowed since this is only an optimization.
+    /// </summary>
+    public async Task WarmAsync(string model, int numCtx, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(model)) return;
+
+        var ctx = numCtx >= 1 ? numCtx : 0;
+        var options = ctx > 0 ? $",\"options\":{{\"num_ctx\":{ctx}}}" : "";
+
+        // Empty prompt + keep_alive just loads the weights; it does not generate.
+        var json = $"{{\"model\":{JsonSerializer.Serialize(model)},\"prompt\":\"\","
+                   + $"\"stream\":false,\"keep_alive\":\"30m\"{options}}}";
+        try
+        {
+            using var req = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/api/generate")
+            {
+                Content = new StringContent(json, System.Text.Encoding.UTF8, "application/json")
+            };
+            using var resp = await _opHttp.SendAsync(req, ct);
+        }
+        catch { /* warm-up is best-effort */ }
+    }
+
+    /// <summary>Forget cached metadata so the next lookup re-queries Ollama (used by Refresh).</summary>
+    public void ClearCache()
+    {
+        _infoCache.Clear();
+        _toolProbeCache.Clear();
+    }
+
+    public void Dispose()
+    {
+        _http.Dispose();
+        _opHttp.Dispose();
+    }
 }

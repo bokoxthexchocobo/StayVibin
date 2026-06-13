@@ -18,14 +18,14 @@
         </Storyboard>
 
         <!--
-          Indeterminate "agent working" bar: a single bright accent stop travels
-          left to right; the fixed transparent ends give it a soft moving glow.
-          Started/stopped from code (SetActivity) so it only runs while working.
+          Spinner inside the Start/Stop button: rotates a small arc while the agent
+          is working. Started/stopped from code (SetActivity) so it only spins while
+          working. This is the primary "agent working" cue.
         -->
-        <Storyboard x:Key="ActivitySlideSb" RepeatBehavior="Forever">
-            <DoubleAnimation Storyboard.TargetName="ActivityStopMid"
-                             Storyboard.TargetProperty="Offset"
-                             From="0.0" To="1.0" Duration="0:0:1.1"/>
+        <Storyboard x:Key="ButtonSpinSb" RepeatBehavior="Forever">
+            <DoubleAnimation Storyboard.TargetName="ButtonSpinner"
+                             Storyboard.TargetProperty="(UIElement.RenderTransform).(RotateTransform.Angle)"
+                             From="0" To="360" Duration="0:0:0.85"/>
         </Storyboard>
     </Window.Resources>
 
@@ -76,11 +76,32 @@
                                 Margin="6,0,0,0" VerticalAlignment="Center"
                                 Click="OnRefreshModels"
                                 ToolTip="Re-scan Ollama for installed models"/>
+                        <Button x:Name="ModelHelpButton" Content="?"
+                                Style="{StaticResource FlatButton}" Padding="9,3" FontSize="13"
+                                Margin="6,0,0,0" VerticalAlignment="Center"
+                                Click="OnModelRecommendations"
+                                ToolTip="Show recommended vibe-coding models by VRAM"/>
+                        <TextBlock Text="Plan" Foreground="{StaticResource TextDim}" FontSize="12"
+                                   VerticalAlignment="Center" Margin="16,0,8,0"/>
+                        <ComboBox x:Name="PlanModeCombo" Style="{StaticResource DarkCombo}"
+                                  MinWidth="92" VerticalAlignment="Center"
+                                  SelectionChanged="OnPlanModeChanged"
+                                  ToolTip="Plan Mode: have the agent plan and wait for your approval before making changes.&#x0a;Off = just do it. Ask = agent asks first. Auto = agent decides. Always = always plan first.">
+                            <ComboBoxItem Content="Off"/>
+                            <ComboBoxItem Content="Ask"/>
+                            <ComboBoxItem Content="Auto"/>
+                            <ComboBoxItem Content="Always"/>
+                        </ComboBox>
+                        <TextBlock Text="Perm" Foreground="{StaticResource TextDim}" FontSize="12"
+                                   VerticalAlignment="Center" Margin="16,0,8,0"/>
+                        <ComboBox x:Name="PermissionModeCombo" Style="{StaticResource DarkCombo}"
+                                  MinWidth="94" VerticalAlignment="Center"
+                                  SelectionChanged="OnPermissionModeChanged"
+                                  ToolTip="Permission mode: Ask pauses for risky/unknown actions. Allow all lets the agent proceed without prompts.">
+                            <ComboBoxItem Content="Ask"/>
+                            <ComboBoxItem Content="Allow all"/>
+                        </ComboBox>
                     </StackPanel>
-
-                    <TextBlock x:Name="StatusText" Grid.Column="1" Text="Stopped"
-                               Foreground="{StaticResource TextDim}" VerticalAlignment="Center"
-                               HorizontalAlignment="Center" FontSize="13"/>
 
                     <StackPanel Grid.Column="2" Orientation="Horizontal">
                         <Button x:Name="ExplorerToggle" Content="Files" Style="{StaticResource FlatButton}"
@@ -92,8 +113,23 @@
                         <Button x:Name="WorkDirButton" Content="Folder" Style="{StaticResource FlatButton}"
                                 Click="OnPickWorkDir" Margin="0,0,8,0"
                                 ToolTip="Choose the working directory the agent operates in"/>
-                        <Button x:Name="StartButton" Content="Start" Style="{StaticResource AccentButton}"
-                                Click="OnStartClick" MinWidth="84"/>
+                        <Button x:Name="StartButton" Style="{StaticResource AccentButton}"
+                                Click="OnStartClick" MinWidth="84">
+                            <StackPanel Orientation="Horizontal">
+                                <!-- Faint full ring + bright arc; the whole grid rotates while working -->
+                                <Grid x:Name="ButtonSpinner" Width="13" Height="13" Margin="0,0,7,0"
+                                      Visibility="Collapsed" VerticalAlignment="Center"
+                                      RenderTransformOrigin="0.5,0.5">
+                                    <Grid.RenderTransform>
+                                        <RotateTransform Angle="0"/>
+                                    </Grid.RenderTransform>
+                                    <Ellipse Width="13" Height="13" Stroke="#59FFFFFF" StrokeThickness="2"/>
+                                    <Ellipse Width="13" Height="13" Stroke="White" StrokeThickness="2"
+                                             StrokeDashArray="5 16" StrokeDashCap="Round"/>
+                                </Grid>
+                                <TextBlock x:Name="StartButtonText" Text="Start" VerticalAlignment="Center"/>
+                            </StackPanel>
+                        </Button>
                     </StackPanel>
                 </Grid>
             </Border>
@@ -118,6 +154,10 @@
                                Foreground="{StaticResource TextDim}" FontSize="12"
                                VerticalAlignment="Center" Margin="10,0,0,0"/>
 
+                    <TextBlock x:Name="StatusText" Grid.Column="3" Text="Stopped"
+                               Foreground="{StaticResource TextDim}" VerticalAlignment="Center"
+                               HorizontalAlignment="Center" FontSize="13"/>
+
                     <StackPanel Grid.Column="4" Orientation="Horizontal" VerticalAlignment="Center">
                         <TextBlock x:Name="TokensText" Text="Tokens: 0"
                                    Foreground="{StaticResource TextDim}" FontSize="12"/>
@@ -141,19 +181,6 @@
                 </Grid>
             </Border>
 
-            <!-- Indeterminate activity line: animates only while the agent works -->
-            <Border x:Name="ActivityBar" Height="3" Background="{StaticResource Bg}"
-                    ClipToBounds="True" Visibility="Collapsed">
-                <Rectangle>
-                    <Rectangle.Fill>
-                        <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
-                            <GradientStop Color="#005B8CFF" Offset="0"/>
-                            <GradientStop x:Name="ActivityStopMid" Color="#FF5B8CFF" Offset="0"/>
-                            <GradientStop Color="#005B8CFF" Offset="1"/>
-                        </LinearGradientBrush>
-                    </Rectangle.Fill>
-                </Rectangle>
-            </Border>
         </StackPanel>
 
         <!-- Main area: Explorer | (Editor | Chat) -->
@@ -298,9 +325,18 @@
                                          Foreground="{StaticResource Text}"
                                          TextWrapping="Wrap" Padding="0"
                                          IsTabStop="False"
+                                         IsInactiveSelectionHighlightEnabled="True"
+                                         Cursor="IBeam"
                                          PreviewMouseWheel="OnBodyMouseWheel"
                                          VerticalScrollBarVisibility="Disabled"
-                                         HorizontalScrollBarVisibility="Disabled"/>
+                                         HorizontalScrollBarVisibility="Disabled">
+                                    <TextBox.ContextMenu>
+                                        <ContextMenu>
+                                            <MenuItem Command="Copy" Header="Copy"/>
+                                            <MenuItem Command="SelectAll" Header="Select All"/>
+                                        </ContextMenu>
+                                    </TextBox.ContextMenu>
+                                </TextBox>
                             </StackPanel>
                         </Border>
                         <DataTemplate.Triggers>
@@ -350,15 +386,75 @@
                       Background="{StaticResource Border}" Visibility="Collapsed"
                       ToolTip="Drag to resize the panel below (input + server log)"/>
 
-        <!-- Bottom dock: input + server log, resized together by the divider above -->
+        <!-- Bottom dock: plan approval banner + input + server log -->
         <Grid Grid.Row="3">
             <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="*"/>
             </Grid.RowDefinitions>
 
+            <!-- Permission banner: shown when OpenHands pauses for risky-action approval -->
+            <Border x:Name="PermissionApprovalBar" Grid.Row="0" Visibility="Collapsed"
+                    Background="{StaticResource PanelAlt}" BorderBrush="{StaticResource Warn}"
+                    BorderThickness="0,2,0,0" Padding="16,10">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                        <TextBlock Text="Permission needed" Foreground="{StaticResource Text}"
+                                   FontWeight="SemiBold" FontSize="13"/>
+                        <TextBlock x:Name="PermissionText"
+                                   Text="The agent wants to perform an action that needs your approval."
+                                   Foreground="{StaticResource TextDim}" FontSize="11"
+                                   Margin="0,2,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                        <Button x:Name="PermissionDenyButton" Content="Deny"
+                                Style="{StaticResource FlatButton}" Click="OnPermissionDeny" Margin="0,0,8,0"
+                                ToolTip="Reject this action and tell the agent it was not allowed"/>
+                        <Button x:Name="PermissionAllowButton" Content="Allow once"
+                                Style="{StaticResource AccentButton}" Click="OnPermissionAllow" Margin="0,0,8,0"
+                                ToolTip="Allow this pending action only"/>
+                        <Button x:Name="PermissionAllowAllButton" Content="Allow all"
+                                Style="{StaticResource FlatButton}" Click="OnPermissionAllowAll"
+                                ToolTip="Allow all future actions in this session"/>
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <!-- Plan approval banner: shown when the agent presents a plan and waits -->
+            <Border x:Name="PlanApprovalBar" Grid.Row="1" Visibility="Collapsed"
+                    Background="{StaticResource PanelAlt}" BorderBrush="{StaticResource Accent}"
+                    BorderThickness="0,2,0,0" Padding="16,10">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                        <TextBlock Text="Plan ready for your approval" Foreground="{StaticResource Text}"
+                                   FontWeight="SemiBold" FontSize="13"/>
+                        <TextBlock Text="Review the plan above, then approve to let the agent make the changes - or type what you want changed."
+                                   Foreground="{StaticResource TextDim}" FontSize="11"
+                                   Margin="0,2,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                        <Button x:Name="PlanDenyButton" Content="Request changes"
+                                Style="{StaticResource FlatButton}" Click="OnPlanDeny" Margin="0,0,8,0"
+                                ToolTip="Reject the plan and tell the agent what to change"/>
+                        <Button x:Name="PlanApproveButton" Content="Approve plan"
+                                Style="{StaticResource AccentButton}" Click="OnPlanApprove"
+                                ToolTip="Let the agent carry out the plan and make the changes"/>
+                    </StackPanel>
+                </Grid>
+            </Border>
+
             <!-- Input -->
-            <Border Grid.Row="0" Background="{StaticResource Panel}" BorderBrush="{StaticResource Border}"
+            <Border Grid.Row="2" Background="{StaticResource Panel}" BorderBrush="{StaticResource Border}"
                     BorderThickness="0,1,0,0" Padding="16,12">
             <Grid>
                 <Grid.RowDefinitions>
@@ -415,7 +511,7 @@
         </Border>
 
             <!-- Log strip + model capabilities -->
-            <Grid Grid.Row="1" Background="{StaticResource Panel}">
+            <Grid Grid.Row="3" Background="{StaticResource Panel}">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="Auto"/>

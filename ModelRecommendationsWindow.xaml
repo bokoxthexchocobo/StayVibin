@@ -1,0 +1,46 @@
+<Window x:Class="StayVibin.ModelRecommendationsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Model Recommendations" Height="620" Width="760"
+        Background="{StaticResource Bg}"
+        WindowStartupLocation="CenterOwner"
+        ResizeMode="CanResize"
+        FontFamily="Segoe UI" FontSize="14">
+    <Grid Margin="18">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0" Margin="0,0,0,12">
+            <TextBlock Text="Recommended Models For Vibe Coding"
+                       Foreground="{StaticResource Text}" FontSize="20"
+                       FontWeight="SemiBold"/>
+            <TextBlock Text="Pick the strongest tool-capable model that fits your VRAM. Commands are for Ollama and can be copied directly."
+                       Foreground="{StaticResource TextDim}" TextWrapping="Wrap"
+                       Margin="0,5,0,0"/>
+        </StackPanel>
+
+        <Border Grid.Row="1" Background="{StaticResource Panel}" BorderBrush="{StaticResource Border}"
+                BorderThickness="1" CornerRadius="10" Padding="12">
+            <TextBox x:Name="RecommendationsBox"
+                     IsReadOnly="True"
+                     Background="Transparent"
+                     BorderThickness="0"
+                     Foreground="{StaticResource Text}"
+                     FontFamily="Consolas"
+                     FontSize="13"
+                     TextWrapping="Wrap"
+                     VerticalScrollBarVisibility="Auto"
+                     HorizontalScrollBarVisibility="Disabled"
+                     IsInactiveSelectionHighlightEnabled="True"/>
+        </Border>
+
+        <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right"
+                    Margin="0,14,0,0">
+            <Button Content="Close" Style="{StaticResource AccentButton}"
+                    MinWidth="90" Click="OnClose"/>
+        </StackPanel>
+    </Grid>
+</Window>

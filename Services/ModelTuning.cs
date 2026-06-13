@@ -1,13 +1,15 @@
 namespace StayVibin.Services;
 
 /// <summary>Recommended generation settings for a given model + its metadata.</summary>
-public sealed record TuneResult(double Temperature, int ContextLength, string ReasoningEffort);
+public sealed record TuneResult(
+    double Temperature, int ContextLength, string ReasoningEffort, bool NativeToolCalling);
 
 /// <summary>
 /// Picks sensible defaults so newbies never have to touch temperature/context.
-/// Coding models run deterministic (temp 0) to stop them rambling; thinking/reasoning
-/// models (DeepSeek-R1, QwQ, Qwen3, Ollama "thinking" capability, etc.) get higher
-/// reasoning effort and a little temperature headroom. Runtime context comes from the
+/// Coding models run deterministic (temp 0) to stop them rambling, while all models
+/// get high reasoning effort because the desktop app is used for agentic coding work.
+/// Thinking/reasoning models (DeepSeek-R1, QwQ, Qwen3, Ollama "thinking" capability,
+/// etc.) also get a little temperature headroom. Runtime context comes from the
 /// user's Settings cap, or "auto" (the model's native window) when the cap is empty.
 /// </summary>
 public static class ModelTuning
@@ -16,10 +18,18 @@ public static class ModelTuning
     public const int FallbackContextLength = 32768;
     public const int ContextFloor = 4096;
 
+    // Ceiling for "auto" context. Modern models advertise huge native windows
+    // (qwen3.5 reports 256K); allocating that as num_ctx forces Ollama to reserve a
+    // massive KV cache, which makes the model take a minute+ to load and can swap or
+    // OOM on 8-16GB machines. Auto therefore never exceeds this - power users who
+    // really want more can set an explicit cap in Settings.
+    public const int AutoContextCap = 32768;
+
     /// <param name="contextCap">
     /// Runtime context window (tokens) from Settings. A positive value is used as-is
-    /// (explicit override). 0 means "auto": use the model's native window, or the 32k
-    /// fallback if Ollama did not report one.
+    /// (explicit override - the user owns the memory trade-off). 0 means "auto": use
+    /// the model's native window but clamped to <see cref="AutoContextCap"/> so a
+    /// model with a 256K native window does not allocate a 256K KV cache by default.
     /// </param>
     public static TuneResult Recommend(string model, ModelInfo? info, int contextCap = 0)
     {
@@ -31,17 +41,36 @@ public static class ModelTuning
         bool isThinking = !isCoder && IsThinkingModel(name, info);
 
         double temperature = isCoder ? 0.0 : isThinking ? 0.55 : 0.2;
-        string reasoning = isThinking ? "high" : "low";
+        const string reasoning = "high";
 
-        // Explicit cap wins; otherwise "auto" uses the model's native window, falling
-        // back to 32k when Ollama did not report one.
+        // Explicit cap wins as-is. Otherwise "auto" uses the model's native window,
+        // clamped to AutoContextCap (and to the 32k fallback when native is unknown).
         long native = info?.ContextLength ?? 0;
-        int ctx = contextCap > 0
-            ? contextCap
-            : native > 0 ? (int)native : FallbackContextLength;
+        int ctx;
+        if (contextCap > 0)
+            ctx = contextCap;
+        else if (native > 0)
+            ctx = (int)Math.Min(native, AutoContextCap);
+        else
+            ctx = FallbackContextLength;
         if (ctx < ContextFloor) ctx = ContextFloor;
 
-        return new TuneResult(temperature, ctx, reasoning);
+        return new TuneResult(temperature, ctx, reasoning, SupportsTools(info));
+    }
+
+    /// <summary>
+    /// True when the model can use real (native) tool calling. Local models that
+    /// support tools call them via Ollama's tool API; forcing the prompt-text
+    /// fallback instead makes capable models emit malformed '&lt;function=...&gt;'
+    /// markup, loop, and punt work back to the user, so we enable native calling
+    /// whenever Ollama advertises the "tools" capability. When metadata is missing
+    /// (Ollama unreachable) we assume native is fine - the ChatText cleaner still
+    /// strips any stray markup as a safety net.
+    /// </summary>
+    public static bool SupportsTools(ModelInfo? info)
+    {
+        if (info?.Capabilities is not { } caps) return true;
+        return caps.Any(c => c.Equals("tools", StringComparison.OrdinalIgnoreCase));
     }
 
     /// <summary>True for instruct/coder variants that should stay deterministic.</summary>
