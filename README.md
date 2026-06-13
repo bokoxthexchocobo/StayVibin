@@ -70,6 +70,25 @@ Produces a self-contained single-file executable at:
 bin\Release\net10.0-windows\win-x64\publish\StayVibin.exe
 ```
 
+## Build the Windows installer (v1.0+)
+
+```
+powershell -ExecutionPolicy Bypass -File .\build-installer.ps1
+```
+
+This publishes a self-contained `StayVibin.exe` and compiles a full setup wizard using
+Inno Setup 6 (downloaded automatically if it is not already installed). Output:
+
+```
+dist\StayVibin-1.0.0-setup.exe
+```
+
+The installer adds Start menu and Add/Remove Programs entries. Optional desktop shortcut.
+It does **not** bundle OpenHands or Ollama - install those separately (see Prerequisites).
+
+Download the latest release from
+[GitHub Releases](https://github.com/bokoxthexchocobo/StayVibin/releases).
+
 ## Using it
 
 1. Press **Folder** to choose the working directory the agent operates in.
@@ -78,7 +97,7 @@ bin\Release\net10.0-windows\win-x64\publish\StayVibin.exe
 3. Type a task and press **Enter** (Shift+Enter for a newline). **Stop**
    interrupts a running agent.
 
-## Current scope (v0.1)
+## Current scope (v1.0)
 
 - Single conversation per session, with Start/Stop, Interrupt, and Steer.
 - Renders user/assistant messages, agent thoughts, tool calls, results, errors.

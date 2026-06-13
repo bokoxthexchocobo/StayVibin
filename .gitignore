@@ -1,6 +1,8 @@
 # Build output
 bin/
 obj/
+dist/
+tools/inno/
 
 # Visual Studio / Rider
 .vs/

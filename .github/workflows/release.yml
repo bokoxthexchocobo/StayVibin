@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $version = (Select-Xml -Path OpenHandsDesktop.csproj -XPath '//Version').Node.InnerText.Trim()
+          Write-Host "Version: $version"
+          ./build-installer.ps1 -Version $version
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/StayVibin-*-setup.exe
+            bin/Release/net10.0-windows/win-x64/publish/StayVibin.exe
+          generate_release_notes: true
