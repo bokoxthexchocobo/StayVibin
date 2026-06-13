@@ -1,11 +1,13 @@
 using System.Collections.ObjectModel;
 using System.Diagnostics;
+using System.IO;
 using System.Text.Json.Nodes;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using ICSharpCode.AvalonEdit.Highlighting;
 using Microsoft.Win32;
 using StayVibin.Models;
 using StayVibin.Services;
@@ -68,8 +70,14 @@ public partial class MainWindow : Window
         Closing += (_, _) => Cleanup();
         Loaded += OnWindowLoaded;
 
+        // Explorer: populate children lazily on expand; double-click opens a file.
+        FileTree.AddHandler(TreeViewItem.ExpandedEvent, new RoutedEventHandler(OnTreeItemExpanded));
+        CodeEditor.TextChanged += OnEditorTextChanged;
+        CodeEditor.PreviewKeyDown += OnEditorKeyDown;
+
         _ = PopulateModelsAsync();
         _ = UpdateRepoBadgeAsync();
+        _ = RefreshTreeAsync();
     }
 
     private void OnWindowLoaded(object sender, RoutedEventArgs e)
@@ -119,6 +127,7 @@ public partial class MainWindow : Window
             _workingDir = _settings.EffectiveWorkingDir;
             WorkDirButton.Content = ShortPath(_workingDir);
             WorkDirButton.ToolTip = _workingDir;
+            _ = RefreshTreeAsync();
 
             if (AgentSpecProvider.SettingsExist)
             {
@@ -306,6 +315,7 @@ public partial class MainWindow : Window
             WorkDirButton.Content = ShortPath(_workingDir);
             WorkDirButton.ToolTip = _workingDir;
             _ = UpdateRepoBadgeAsync();
+            _ = RefreshTreeAsync();
         }
     }
 
@@ -999,6 +1009,7 @@ public partial class MainWindow : Window
                 if (falling)
                 {
                     _ = UpdateRepoBadgeAsync();   // the agent may have committed/branched
+                    _ = RefreshTreeAsync();       // surface any files the agent changed
                     _ = FlushQueueAsync();        // send the next queued message, if any
                 }
             }
@@ -1152,6 +1163,195 @@ public partial class MainWindow : Window
         TokensText.Text = "Tokens: 0";
         CostText.Text = "";
         CompactText.Text = "Auto-compact: on";
+    }
+
+    // ---- file explorer ------------------------------------------------------
+
+    private List<FileNode> _treeRoots = new();
+    private IReadOnlyDictionary<string, char> _statusMap = new Dictionary<string, char>();
+
+    /// <summary>Rescan the working folder and git status into the explorer tree.</summary>
+    private async Task RefreshTreeAsync()
+    {
+        if (string.IsNullOrWhiteSpace(_workingDir) || !Directory.Exists(_workingDir))
+        {
+            FileTree.ItemsSource = null;
+            return;
+        }
+
+        _statusMap = await GitService.GetStatusMapAsync(_workingDir);
+        _treeRoots = WorkspaceExplorer.Load(_workingDir, _statusMap);
+        FileTree.ItemsSource = _treeRoots;
+
+        // If the open file changed on disk (e.g. the agent edited it) and we have
+        // no unsaved edits, refresh the editor to match.
+        ReloadEditorIfChangedOnDisk();
+    }
+
+    private void OnRefreshTree(object sender, RoutedEventArgs e) => _ = RefreshTreeAsync();
+
+    /// <summary>Lazily fill a folder's children the first time it is expanded.</summary>
+    private void OnTreeItemExpanded(object sender, RoutedEventArgs e)
+    {
+        if (e.OriginalSource is not TreeViewItem { DataContext: FileNode node } || !node.IsDirectory)
+            return;
+
+        if (node.Children.Count == 1 && node.Children[0].IsPlaceholder)
+        {
+            node.Children.Clear();
+            foreach (var child in WorkspaceExplorer.Load(node.FullPath, _statusMap))
+                node.Children.Add(child);
+        }
+    }
+
+    private void OnTreeDoubleClick(object sender, MouseButtonEventArgs e)
+    {
+        if (FileTree.SelectedItem is FileNode { IsDirectory: false } node)
+            OpenFileInEditor(node.FullPath);
+    }
+
+    /// <summary>Show or hide the explorer column.</summary>
+    private void OnToggleExplorer(object sender, RoutedEventArgs e)
+        => ExplorerCol.Width = ExplorerCol.Width.Value > 0 ? new GridLength(0) : new GridLength(250);
+
+    // ---- code editor --------------------------------------------------------
+
+    private string? _editorPath;
+    private bool _editorDirty;
+    private bool _loadingEditor;          // suppress dirty-tracking while loading text
+    private DateTime _editorDiskWrite;    // last-write stamp of the loaded file
+
+    private const long MaxEditorBytes = 2_000_000;
+
+    /// <summary>Load a file into the editor (read-only of binaries/huge files is refused).</summary>
+    private void OpenFileInEditor(string path)
+    {
+        try
+        {
+            var info = new FileInfo(path);
+            if (info.Length > MaxEditorBytes)
+            {
+                AddSystem($"{Path.GetFileName(path)} is too large to open here ({info.Length / 1024:N0} KB).");
+                return;
+            }
+
+            var bytes = File.ReadAllBytes(path);
+            if (Array.IndexOf(bytes, (byte)0) >= 0)
+            {
+                AddSystem($"{Path.GetFileName(path)} looks like a binary file; not opening it in the editor.");
+                return;
+            }
+
+            _loadingEditor = true;
+            CodeEditor.Text = System.Text.Encoding.UTF8.GetString(bytes);
+            CodeEditor.SyntaxHighlighting =
+                HighlightingManager.Instance.GetDefinitionByExtension(Path.GetExtension(path));
+            _loadingEditor = false;
+
+            _editorPath = path;
+            _editorDiskWrite = info.LastWriteTimeUtc;
+            _editorDirty = false;
+            EditorSaveButton.IsEnabled = false;
+            EditorTitle.Text = Path.GetFileName(path);
+            EditorTitle.ToolTip = path;
+            ShowEditor(true);
+        }
+        catch (Exception ex)
+        {
+            AddError($"Could not open {Path.GetFileName(path)}: {ex.Message}");
+        }
+    }
+
+    /// <summary>Toggle the editor column open/closed and its splitter.</summary>
+    private void ShowEditor(bool show)
+    {
+        if (show)
+        {
+            EditorCol.Width = new GridLength(1.4, GridUnitType.Star);
+            EditorCol.MinWidth = 260;
+            EditorSplitter.Visibility = Visibility.Visible;
+        }
+        else
+        {
+            EditorCol.Width = new GridLength(0);
+            EditorCol.MinWidth = 0;
+            EditorSplitter.Visibility = Visibility.Collapsed;
+            _editorPath = null;
+            _editorDirty = false;
+        }
+    }
+
+    private void OnEditorTextChanged(object? sender, EventArgs e)
+    {
+        if (_loadingEditor || _editorPath is null || _editorDirty) return;
+        _editorDirty = true;
+        EditorSaveButton.IsEnabled = true;
+        EditorTitle.Text = Path.GetFileName(_editorPath) + " *";
+    }
+
+    private void OnEditorKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.S && (Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control)
+        {
+            e.Handled = true;
+            SaveEditor();
+        }
+    }
+
+    private void OnEditorSave(object sender, RoutedEventArgs e) => SaveEditor();
+
+    private void SaveEditor()
+    {
+        if (_editorPath is null || !_editorDirty) return;
+        try
+        {
+            File.WriteAllText(_editorPath, CodeEditor.Text);
+            _editorDirty = false;
+            _editorDiskWrite = File.GetLastWriteTimeUtc(_editorPath);
+            EditorSaveButton.IsEnabled = false;
+            EditorTitle.Text = Path.GetFileName(_editorPath);
+            _ = RefreshTreeAsync();        // file is now modified per git
+            _ = UpdateRepoBadgeAsync();
+        }
+        catch (Exception ex)
+        {
+            AddError($"Could not save {Path.GetFileName(_editorPath)}: {ex.Message}");
+        }
+    }
+
+    private void OnEditorClose(object sender, RoutedEventArgs e)
+    {
+        if (_editorDirty && _editorPath is not null)
+        {
+            var choice = MessageBox.Show(
+                this, $"Save changes to {Path.GetFileName(_editorPath)}?", "Unsaved changes",
+                MessageBoxButton.YesNoCancel, MessageBoxImage.Question);
+            if (choice == MessageBoxResult.Cancel) return;
+            if (choice == MessageBoxResult.Yes) SaveEditor();
+        }
+        ShowEditor(false);
+    }
+
+    /// <summary>Reload the open file if it changed on disk and has no unsaved edits.</summary>
+    private void ReloadEditorIfChangedOnDisk()
+    {
+        if (_editorPath is null || _editorDirty || !File.Exists(_editorPath)) return;
+        try
+        {
+            var write = File.GetLastWriteTimeUtc(_editorPath);
+            if (write <= _editorDiskWrite) return;
+
+            var caret = CodeEditor.CaretOffset;
+            _loadingEditor = true;
+            CodeEditor.Text = File.ReadAllText(_editorPath);
+            _loadingEditor = false;
+            CodeEditor.CaretOffset = Math.Min(caret, CodeEditor.Document.TextLength);
+            _editorDiskWrite = write;
+            _editorDirty = false;
+            EditorSaveButton.IsEnabled = false;
+            EditorTitle.Text = Path.GetFileName(_editorPath);
+        }
+        catch { /* leave the current buffer as-is on any read error */ }
     }
 
     // ---- teardown -----------------------------------------------------------

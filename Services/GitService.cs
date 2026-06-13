@@ -54,6 +54,52 @@ public static class GitService
         return new GitStatus(branch, dirty, slug);
     }
 
+    /// <summary>
+    /// Map every changed path in the repo to its git status code (the worktree
+    /// column from 'git status --porcelain', or '?' for untracked). Keys are
+    /// absolute paths. Empty if the folder isn't a repo or git is unavailable.
+    /// Used to color the explorer tree.
+    /// </summary>
+    public static async Task<IReadOnlyDictionary<string, char>> GetStatusMapAsync(string workingDir)
+    {
+        var map = new Dictionary<string, char>(StringComparer.OrdinalIgnoreCase);
+        if (!GitAvailable || string.IsNullOrWhiteSpace(workingDir) || !Directory.Exists(workingDir))
+            return map;
+
+        var (topOk, topOut) = await RunAsync("git", "rev-parse --show-toplevel", workingDir);
+        if (!topOk) return map;
+        var root = topOut.Trim();
+        if (string.IsNullOrEmpty(root)) return map;
+
+        var (ok, output) = await RunAsync("git", "status --porcelain", workingDir);
+        if (!ok) return map;
+
+        foreach (var raw in output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var line = raw.TrimEnd('\r');
+            if (line.Length < 4) continue;
+
+            char x = line[0], y = line[1];
+            // Untracked wins; otherwise prefer the worktree column, then the index.
+            char code = (x == '?' || y == '?') ? '?' : (y != ' ' ? y : x);
+
+            var pathPart = line[3..];
+            var arrow = pathPart.IndexOf(" -> ", StringComparison.Ordinal);  // renames
+            if (arrow >= 0) pathPart = pathPart[(arrow + 4)..];
+            pathPart = pathPart.Trim().Trim('"');
+            if (pathPart.Length == 0) continue;
+
+            try
+            {
+                var full = Path.GetFullPath(Path.Combine(root,
+                    pathPart.Replace('/', Path.DirectorySeparatorChar)));
+                map[full] = code;
+            }
+            catch { /* skip unparseable paths */ }
+        }
+        return map;
+    }
+
     /// <summary>The authenticated GitHub account (via gh), or null if gh is missing/unauthenticated.</summary>
     public static async Task<string?> GhAccountAsync()
     {

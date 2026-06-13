@@ -2,6 +2,7 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:models="clr-namespace:StayVibin.Models"
+        xmlns:ae="http://icsharpcode.net/sharpdevelop/avalonedit"
         Title="StayVibin" Height="760" Width="1080"
         Icon="Assets/stayvibin.png"
         Background="{StaticResource Bg}"
@@ -47,6 +48,9 @@
                                HorizontalAlignment="Center" FontSize="13"/>
 
                     <StackPanel Grid.Column="2" Orientation="Horizontal">
+                        <Button x:Name="ExplorerToggle" Content="Files" Style="{StaticResource FlatButton}"
+                                Click="OnToggleExplorer" Margin="0,0,8,0"
+                                ToolTip="Show/hide the file explorer"/>
                         <Button x:Name="SettingsButton" Content="Settings" Style="{StaticResource FlatButton}"
                                 Click="OnSettingsClick" Margin="0,0,8,0"
                                 ToolTip="Open settings"/>
@@ -103,8 +107,129 @@
             </Border>
         </StackPanel>
 
-        <!-- Conversation -->
-        <ScrollViewer x:Name="ChatScroll" Grid.Row="1" VerticalScrollBarVisibility="Auto"
+        <!-- Main area: Explorer | (Editor | Chat) -->
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition x:Name="ExplorerCol" Width="250" MinWidth="0"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- File explorer -->
+            <Border Grid.Column="0" Background="{StaticResource Panel}"
+                    BorderBrush="{StaticResource Border}" BorderThickness="0,0,1,0">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+
+                    <Grid Grid.Row="0" Margin="10,8,8,6">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="Explorer" Foreground="{StaticResource TextDim}" FontSize="12"
+                                   FontWeight="SemiBold" VerticalAlignment="Center"/>
+                        <Button Grid.Column="1" Content="Refresh" Style="{StaticResource FlatButton}"
+                                Padding="8,2" FontSize="11" Click="OnRefreshTree"
+                                ToolTip="Rescan the working folder and git status"/>
+                    </Grid>
+
+                    <TreeView x:Name="FileTree" Grid.Row="1" Background="Transparent"
+                              BorderThickness="0" Foreground="{StaticResource Text}"
+                              MouseDoubleClick="OnTreeDoubleClick"
+                              ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                        <TreeView.Resources>
+                            <HierarchicalDataTemplate DataType="{x:Type models:FileNode}"
+                                                      ItemsSource="{Binding Children}">
+                                <StackPanel Orientation="Horizontal" Margin="0,1">
+                                    <TextBlock Text="{Binding Icon}" FontFamily="Segoe UI Emoji"
+                                               FontSize="12" VerticalAlignment="Center" Margin="0,0,5,0"/>
+                                    <TextBlock x:Name="NameText" Text="{Binding Name}"
+                                               VerticalAlignment="Center" Foreground="{StaticResource Text}"/>
+                                    <TextBlock Text="{Binding StatusText}" FontSize="10" FontWeight="Bold"
+                                               VerticalAlignment="Center" Margin="6,0,0,0"
+                                               Foreground="{StaticResource Warn}"/>
+                                </StackPanel>
+                                <HierarchicalDataTemplate.Triggers>
+                                    <DataTrigger Binding="{Binding Status}" Value="?">
+                                        <Setter TargetName="NameText" Property="Foreground" Value="{StaticResource Ok}"/>
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding Status}" Value="A">
+                                        <Setter TargetName="NameText" Property="Foreground" Value="{StaticResource Ok}"/>
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding Status}" Value="M">
+                                        <Setter TargetName="NameText" Property="Foreground" Value="{StaticResource Warn}"/>
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding Status}" Value="D">
+                                        <Setter TargetName="NameText" Property="Foreground" Value="{StaticResource Err}"/>
+                                    </DataTrigger>
+                                </HierarchicalDataTemplate.Triggers>
+                            </HierarchicalDataTemplate>
+                        </TreeView.Resources>
+                    </TreeView>
+                </Grid>
+            </Border>
+
+            <GridSplitter Grid.Column="1" Width="6" HorizontalAlignment="Center"
+                          VerticalAlignment="Stretch" Background="{StaticResource Border}"
+                          Cursor="SizeWE" ResizeBehavior="PreviousAndNext" ResizeDirection="Columns"
+                          ToolTip="Drag to resize the explorer"/>
+
+            <!-- Editor | Conversation -->
+            <Grid Grid.Column="2">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition x:Name="EditorCol" Width="0" MinWidth="0"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*" MinWidth="240"/>
+                </Grid.ColumnDefinitions>
+
+                <!-- Code editor (hidden until a file is opened) -->
+                <Border Grid.Column="0" Background="{StaticResource Bg}"
+                        BorderBrush="{StaticResource Border}" BorderThickness="0,0,1,0">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                        </Grid.RowDefinitions>
+
+                        <Grid Grid.Row="0" Background="{StaticResource Panel}">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock x:Name="EditorTitle" Text="" Foreground="{StaticResource Text}"
+                                       FontSize="12" VerticalAlignment="Center" Margin="12,6"
+                                       TextTrimming="CharacterEllipsis"/>
+                            <Button x:Name="EditorSaveButton" Grid.Column="1" Content="Save"
+                                    Style="{StaticResource FlatButton}" Padding="10,3" FontSize="11"
+                                    Margin="0,4,6,4" Click="OnEditorSave" IsEnabled="False"
+                                    ToolTip="Save (Ctrl+S)"/>
+                            <Button Grid.Column="2" Content="&#x2715;" Style="{StaticResource FlatButton}"
+                                    Padding="8,3" FontSize="11" Margin="0,4,8,4" Click="OnEditorClose"
+                                    ToolTip="Close the editor"/>
+                        </Grid>
+
+                        <ae:TextEditor x:Name="CodeEditor" Grid.Row="1" ShowLineNumbers="True"
+                                       FontFamily="Consolas" FontSize="13"
+                                       Background="{StaticResource Bg}" Foreground="{StaticResource Text}"
+                                       LineNumbersForeground="{StaticResource TextDim}"
+                                       WordWrap="False"
+                                       HorizontalScrollBarVisibility="Auto"
+                                       VerticalScrollBarVisibility="Auto"/>
+                    </Grid>
+                </Border>
+
+                <GridSplitter x:Name="EditorSplitter" Grid.Column="1" Width="6" Visibility="Collapsed"
+                              HorizontalAlignment="Center" VerticalAlignment="Stretch"
+                              Background="{StaticResource Border}" Cursor="SizeWE"
+                              ResizeBehavior="PreviousAndNext" ResizeDirection="Columns"
+                              ToolTip="Drag to resize the editor"/>
+
+                <!-- Conversation -->
+                <ScrollViewer x:Name="ChatScroll" Grid.Column="2" VerticalScrollBarVisibility="Auto"
                       Padding="20,16" Background="{StaticResource Bg}">
             <ItemsControl x:Name="ChatList">
                 <ItemsControl.ItemTemplate>
@@ -164,7 +289,9 @@
                     </DataTemplate>
                 </ItemsControl.ItemTemplate>
             </ItemsControl>
-        </ScrollViewer>
+                </ScrollViewer>
+            </Grid>
+        </Grid>
 
         <!-- Draggable divider: resize the bottom dock (input + server log) -->
         <GridSplitter Grid.Row="2" Height="6" HorizontalAlignment="Stretch"
