@@ -11,9 +11,9 @@
     <Grid Margin="0">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
+            <RowDefinition Height="*" MinHeight="140"/>
             <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="200" MinHeight="110"/>
         </Grid.RowDefinitions>
 
         <!-- Top bar + stats strip -->
@@ -166,9 +166,23 @@
             </ItemsControl>
         </ScrollViewer>
 
-        <!-- Input -->
-        <Border Grid.Row="2" Background="{StaticResource Panel}" BorderBrush="{StaticResource Border}"
-                BorderThickness="0,1,0,0" Padding="16,12">
+        <!-- Draggable divider: resize the bottom dock (input + server log) -->
+        <GridSplitter Grid.Row="2" Height="6" HorizontalAlignment="Stretch"
+                      VerticalAlignment="Center" ResizeDirection="Rows"
+                      ResizeBehavior="PreviousAndNext" Cursor="SizeNS"
+                      Background="{StaticResource Border}"
+                      ToolTip="Drag to resize the panel below (input + server log)"/>
+
+        <!-- Bottom dock: input + server log, resized together by the divider above -->
+        <Grid Grid.Row="3">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+            </Grid.RowDefinitions>
+
+            <!-- Input -->
+            <Border Grid.Row="0" Background="{StaticResource Panel}" BorderBrush="{StaticResource Border}"
+                    BorderThickness="0,1,0,0" Padding="16,12">
             <Grid>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto"/>
@@ -205,29 +219,35 @@
 
                     <StackPanel Grid.Column="2" Orientation="Horizontal" Margin="10,0,0,0"
                                 VerticalAlignment="Bottom">
-                        <Button x:Name="InterruptButton" Content="Interrupt" Style="{StaticResource FlatButton}"
+                        <TextBlock x:Name="QueueText" Text="" Foreground="{StaticResource Warn}"
+                                   FontSize="11" VerticalAlignment="Center" Margin="0,0,10,0"
+                                   Visibility="Collapsed"
+                                   ToolTip="Messages waiting to send after the agent finishes its current task"/>
+                        <Button x:Name="InterruptButton" Content="Stop" Style="{StaticResource FlatButton}"
                                 Click="OnInterruptClick" IsEnabled="False" Margin="0,0,8,0"
-                                ToolTip="Cancel the agent's current turn"/>
+                                ToolTip="Stop the agent's current task (keeps the session running)"/>
                         <Button x:Name="SteerButton" Content="Steer" Style="{StaticResource FlatButton}"
                                 Click="OnSteerClick" IsEnabled="False" Margin="0,0,8,0"
-                                ToolTip="Send a note to the agent while it keeps working (Enter while running)"/>
+                                ToolTip="Interject a note immediately while the agent keeps working (skips the queue)"/>
                         <Button x:Name="SendButton" Content="Send" Style="{StaticResource AccentButton}"
-                                Click="OnSendClick" IsEnabled="False"/>
+                                Click="OnSendClick" IsEnabled="False"
+                                ToolTip="Send now, or queue to send after the current task finishes (Enter)"/>
                     </StackPanel>
                 </Grid>
             </Grid>
         </Border>
 
-        <!-- Log strip + model capabilities -->
-        <Grid Grid.Row="3" Background="{StaticResource Panel}">
+            <!-- Log strip + model capabilities -->
+            <Grid Grid.Row="1" Background="{StaticResource Panel}">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="Auto"/>
             </Grid.ColumnDefinitions>
 
             <Expander Grid.Column="0" Header="Server log" Foreground="{StaticResource TextDim}"
-                      Background="{StaticResource Panel}" Padding="12,4" IsExpanded="False">
-                <ScrollViewer x:Name="LogScroll" Height="120" VerticalScrollBarVisibility="Auto">
+                      Background="{StaticResource Panel}" Padding="12,4" IsExpanded="False"
+                      VerticalAlignment="Stretch" VerticalContentAlignment="Stretch">
+                <ScrollViewer x:Name="LogScroll" VerticalScrollBarVisibility="Auto">
                     <TextBox x:Name="LogBox" IsReadOnly="True" Background="{StaticResource Bg}"
                              Foreground="{StaticResource TextDim}" BorderThickness="0"
                              FontFamily="Consolas" FontSize="12" TextWrapping="NoWrap"
@@ -241,6 +261,7 @@
                            VerticalAlignment="Center" Margin="0,0,8,0"/>
                 <StackPanel x:Name="CapabilityPanel" Orientation="Horizontal" VerticalAlignment="Center"/>
             </StackPanel>
+            </Grid>
         </Grid>
     </Grid>
 </Window>

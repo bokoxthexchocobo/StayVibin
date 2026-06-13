@@ -138,6 +138,31 @@
                           Content="Auto-tune temperature, reasoning and context for the selected model (recommended)"
                           ToolTip="Detects each model's settings from Ollama so you don't have to. Overrides the temperature/context fields above on start."/>
 
+                <TextBlock Text="GitHub" Style="{StaticResource SectionHeader}"/>
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="190"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="40"/>
+                    </Grid.RowDefinitions>
+
+                    <TextBlock Grid.Row="0" Grid.Column="0" Text="Account" Style="{StaticResource FieldLabel}"/>
+                    <TextBlock x:Name="GitHubStatusText" Grid.Row="0" Grid.Column="1" Text="Checking..."
+                               Foreground="{StaticResource TextDim}" VerticalAlignment="Center"
+                               TextWrapping="Wrap"/>
+                    <StackPanel Grid.Row="0" Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                        <Button x:Name="GhSignInButton" Content="Sign in" Style="{StaticResource FlatButton}"
+                                Margin="0,0,8,0" Padding="12,5" Click="OnGhSignIn" IsEnabled="False"
+                                ToolTip="Open a terminal to sign in to GitHub (gh auth login)"/>
+                        <Button x:Name="GhSignOutButton" Content="Sign out" Style="{StaticResource FlatButton}"
+                                Padding="12,5" Click="OnGhSignOut" IsEnabled="False"
+                                ToolTip="Sign out of GitHub (gh auth logout)"/>
+                    </StackPanel>
+                </Grid>
+
                 <TextBlock x:Name="ErrorText" Foreground="{StaticResource Err}" FontSize="12"
                            Margin="0,16,0,0" TextWrapping="Wrap" Visibility="Collapsed"/>
             </StackPanel>

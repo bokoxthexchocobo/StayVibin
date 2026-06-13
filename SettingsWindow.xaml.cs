@@ -66,6 +66,91 @@ public partial class SettingsWindow : Window
             ShowError("No saved model config found (~/.openhands/agent_settings.json). "
                       + "Run the OpenHands CLI once to configure a model; app settings below still apply.");
         }
+
+        // Refresh GitHub status when the window opens and whenever it regains focus
+        // (so it updates after the user completes sign-in in the terminal).
+        Activated += async (_, _) => await RefreshGitHubStatusAsync();
+    }
+
+    // ---- GitHub account -----------------------------------------------------
+
+    private bool _ghRefreshing;
+
+    /// <summary>Reflect the current gh auth state in the GitHub section.</summary>
+    private async Task RefreshGitHubStatusAsync()
+    {
+        if (_ghRefreshing) return;
+        _ghRefreshing = true;
+        try
+        {
+            if (!GitService.GhAvailable)
+            {
+                GitHubStatusText.Text = "GitHub CLI (gh) is not installed.";
+                GhSignInButton.IsEnabled = false;
+                GhSignOutButton.IsEnabled = false;
+                return;
+            }
+
+            var account = await GitService.GhAccountAsync();
+            if (account is null)
+            {
+                GitHubStatusText.Text = "Not signed in.";
+                GhSignInButton.IsEnabled = true;
+                GhSignOutButton.IsEnabled = false;
+            }
+            else
+            {
+                GitHubStatusText.Text = $"Signed in as {account}.";
+                GhSignInButton.IsEnabled = true;   // allow signing in as a different account
+                GhSignOutButton.IsEnabled = true;
+            }
+        }
+        finally
+        {
+            _ghRefreshing = false;
+        }
+    }
+
+    /// <summary>Launch gh's interactive web sign-in in a visible terminal window.</summary>
+    private void OnGhSignIn(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            // gh's web login prints a one-time code and opens the browser, so it
+            // needs a real terminal the user can interact with.
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "powershell.exe",
+                Arguments = "-NoExit -Command \"gh auth login --web --hostname github.com\"",
+                UseShellExecute = true
+            });
+            GitHubStatusText.Text = "Finish sign-in in the terminal window, then return here.";
+        }
+        catch (Exception ex)
+        {
+            ShowError($"Could not start GitHub sign-in: {ex.Message}");
+        }
+    }
+
+    /// <summary>Sign out of GitHub via gh, after confirming.</summary>
+    private async void OnGhSignOut(object sender, RoutedEventArgs e)
+    {
+        var confirm = MessageBox.Show(
+            this,
+            "Sign out of GitHub (github.com)?\n\n"
+            + "The agent won't be able to use GitHub features (PRs, issues, private "
+            + "clones) until you sign in again.",
+            "Sign out of GitHub?",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Question);
+        if (confirm != MessageBoxResult.Yes) return;
+
+        GhSignOutButton.IsEnabled = false;
+        var (ok, message) = await GitService.GhLogoutAsync();
+        if (!ok && !string.IsNullOrWhiteSpace(message))
+            MessageBox.Show(this, message, "Sign out", MessageBoxButton.OK, MessageBoxImage.Warning);
+
+        await RefreshGitHubStatusAsync();
     }
 
     private void SelectReasoning(string? value)

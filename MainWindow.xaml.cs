@@ -30,6 +30,13 @@ public partial class MainWindow : Window
     private bool _agentRunning;     // the agent loop is actively running
     private ChatItem? _streamingItem;
 
+    // Messages typed while the agent is busy wait here and are sent one at a time
+    // as each agent turn finishes (queueing is the default; Steer interjects now).
+    private readonly Queue<QueuedMessage> _queue = new();
+
+    /// <summary>A user message waiting to be sent after the current turn finishes.</summary>
+    private sealed record QueuedMessage(ChatItem Bubble, string Text, List<string> Images);
+
     private OllamaClient? _ollama;
     private JsonNode? _llmTemplate;     // detached clone of the configured LLM (for switches)
     private string? _selectedModel;     // ollama tag, e.g. "qwen2.5-coder:14b"
@@ -502,20 +509,28 @@ public partial class MainWindow : Window
             }
         }
 
-        // Enter sends (or steers when the agent is running); Shift+Enter = newline.
+        // Enter sends, or queues the message when the agent is busy; Shift+Enter =
+        // newline. To interject immediately mid-task, use the Steer button.
         if (e.Key == Key.Enter && (Keyboard.Modifiers & ModifierKeys.Shift) == 0)
         {
             e.Handled = true;
-            if (_agentRunning) await SteerAsync();
-            else await SendAsync();
+            await SendAsync();
         }
     }
 
-    /// <summary>Cancel the agent's in-flight turn without ending the session.</summary>
+    /// <summary>
+    /// Stop the agent's in-flight task (pause) without ending the session. Also
+    /// drops any queued messages, since the user is explicitly halting work.
+    /// </summary>
     private async void OnInterruptClick(object sender, RoutedEventArgs e)
     {
         if (_client is null) return;
-        AddSystem("Interrupting...");
+        int dropped = _queue.Count;
+        _queue.Clear();
+        UpdateQueueIndicator();
+        AddSystem(dropped > 0
+            ? $"Stopping the agent's current task (cleared {dropped} queued message(s))..."
+            : "Stopping the agent's current task...");
         await _client.InterruptAsync();
     }
 
@@ -828,37 +843,60 @@ public partial class MainWindow : Window
 
     // ---- agent stream handling ---------------------------------------------
 
+    /// <summary>Build the bubble text shown to the user (message plus attachment list).</summary>
+    private string ComposeShown(string text, bool hasAttachments)
+        => hasAttachments
+            ? (text.Length > 0 ? text + "\n" : "")
+              + string.Join("\n", _attachments.Select(a => $"[{a.Kind}] {a.FileName}"))
+            : text;
+
+    /// <summary>
+    /// Send the typed message. If the agent is already working, the message is
+    /// queued and sent automatically when the current task finishes (use Steer to
+    /// interject immediately instead).
+    /// </summary>
     private async Task SendAsync()
     {
         var text = InputBox.Text.Trim();
         bool hasAttachments = _attachments.Count > 0;
         if ((text.Length == 0 && !hasAttachments) || _client is null || _busy) return;
 
-        var shown = hasAttachments
-            ? (text.Length > 0 ? text + "\n" : "")
-              + string.Join("\n", _attachments.Select(a => $"[{a.Kind}] {a.FileName}"))
-            : text;
-
+        var shown = ComposeShown(text, hasAttachments);
         InputBox.Clear();
+
+        // Capture attachments now (staging clears the tray), so each queued message
+        // keeps its own files/images.
+        var (note, images) = await ConsumeAttachmentsAsync();
+        var payload = text + note;
+
+        if (_agentRunning)
+        {
+            var queuedBubble = AddItem(ChatRole.User, "You (queued)", shown);
+            _queue.Enqueue(new QueuedMessage(queuedBubble, payload, images));
+            UpdateQueueIndicator();
+            return;
+        }
+
         AddUser(shown);
         _streamingItem = null;
         SetRunning(true);
 
         try
         {
-            var (note, images) = await ConsumeAttachmentsAsync();
-            await _client.SendUserMessageAsync(text + note, images);
+            await _client.SendUserMessageAsync(payload, images);
         }
         catch (Exception ex)
         {
             AddError($"Failed to send: {ex.Message}");
             SetRunning(false);
+            await FlushQueueAsync();
         }
     }
 
     /// <summary>
     /// Inject a message while the agent is still working. The running loop picks
-    /// it up on its next step, so you can nudge it without stopping it.
+    /// it up on its next step, so you can nudge it without stopping it. Unlike a
+    /// normal send, a steer skips the queue and goes through right away.
     /// </summary>
     private async Task SteerAsync()
     {
@@ -866,11 +904,7 @@ public partial class MainWindow : Window
         bool hasAttachments = _attachments.Count > 0;
         if ((text.Length == 0 && !hasAttachments) || _client is null) return;
 
-        var shown = hasAttachments
-            ? (text.Length > 0 ? text + "\n" : "")
-              + string.Join("\n", _attachments.Select(a => $"[{a.Kind}] {a.FileName}"))
-            : text;
-
+        var shown = ComposeShown(text, hasAttachments);
         InputBox.Clear();
         AddItem(ChatRole.User, "You (steer)", shown);
         try
@@ -882,6 +916,38 @@ public partial class MainWindow : Window
         {
             AddError($"Failed to steer: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Send the next queued message, if any, now that the agent is idle. Called on
+    /// the running-&gt;idle transition so queued messages fire one at a time.
+    /// </summary>
+    private async Task FlushQueueAsync()
+    {
+        if (_client is null || _agentRunning || _queue.Count == 0) return;
+
+        var msg = _queue.Dequeue();
+        UpdateQueueIndicator();
+        msg.Bubble.Header = "You";   // it's no longer waiting
+        _streamingItem = null;
+        SetRunning(true);
+        try
+        {
+            await _client.SendUserMessageAsync(msg.Text, msg.Images);
+        }
+        catch (Exception ex)
+        {
+            AddError($"Failed to send queued message: {ex.Message}");
+            SetRunning(false);
+        }
+    }
+
+    /// <summary>Show or hide the "N queued" indicator next to the input buttons.</summary>
+    private void UpdateQueueIndicator()
+    {
+        int n = _queue.Count;
+        QueueText.Text = n == 0 ? "" : n == 1 ? "1 queued" : $"{n} queued";
+        QueueText.Visibility = n == 0 ? Visibility.Collapsed : Visibility.Visible;
     }
 
     private void OnAgentUpdate(AgentUpdate u)
@@ -925,11 +991,16 @@ public partial class MainWindow : Window
         {
             var s = status.ToLowerInvariant();
             bool running = s.Contains("running");
+            bool falling = _agentRunning && !running;   // a turn just finished
             SetRunning(running);
             if (!running)
             {
                 SetStatus(Capitalize(status), AppDot.Idle);
-                _ = UpdateRepoBadgeAsync();  // the agent may have committed/branched
+                if (falling)
+                {
+                    _ = UpdateRepoBadgeAsync();   // the agent may have committed/branched
+                    _ = FlushQueueAsync();        // send the next queued message, if any
+                }
             }
             else
                 SetStatus("Agent working...", AppDot.Working);
@@ -1052,7 +1123,10 @@ public partial class MainWindow : Window
             InterruptButton.IsEnabled = false;
             SteerButton.IsEnabled = false;
             SendButton.IsEnabled = false;
+            SendButton.Content = "Send";
             ClearAttachments();
+            _queue.Clear();
+            UpdateQueueIndicator();
             _agentRunning = false;
             ResetStatsDisplay();
         }
@@ -1062,9 +1136,12 @@ public partial class MainWindow : Window
     {
         _agentRunning = running;
         bool session = _client is not null;
-        InterruptButton.IsEnabled = running;
-        SteerButton.IsEnabled = running;
-        SendButton.IsEnabled = !running && session;
+        InterruptButton.IsEnabled = running;     // "Stop" - halts the current task
+        SteerButton.IsEnabled = running;         // interject immediately
+        // Send stays available while running so a message can be queued; its label
+        // reflects whether it will send now or wait for the current task to finish.
+        SendButton.IsEnabled = session;
+        SendButton.Content = running ? "Queue" : "Send";
         InputBox.IsEnabled = session;
     }
 

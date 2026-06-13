@@ -145,14 +145,19 @@ public sealed class AgentServerClient : IDisposable
         }
     }
 
-    /// <summary>Interrupt a running conversation (cancels the in-flight LLM call).</summary>
+    /// <summary>
+    /// Pause a running conversation, stopping the agent's current task (it can be
+    /// resumed later by sending another message). This is the server's "pause"
+    /// endpoint - there is no "interrupt" route, so calling the wrong one 404s and
+    /// the agent keeps running.
+    /// </summary>
     public async Task InterruptAsync(CancellationToken ct = default)
     {
         if (ConversationId is null) return;
         try
         {
             using var resp = await _http.PostAsync(
-                $"{_baseUrl}/api/conversations/{ConversationId}/interrupt", content: null, ct);
+                $"{_baseUrl}/api/conversations/{ConversationId}/pause", content: null, ct);
         }
         catch { /* best effort */ }
     }

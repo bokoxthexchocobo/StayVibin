@@ -82,6 +82,12 @@ public sealed class BackendManager : IDisposable
         psi.Environment["PYTHONUTF8"] = "1";
         psi.Environment["OLLAMA_CONTEXT_LENGTH"] = _contextLength.ToString();
 
+        // Let small-context local models run. OpenHands otherwise refuses any model
+        // whose context window is below 16,384 tokens (e.g. gemma2:9b at 8,192) and
+        // fails the switch/start with a 500. This env var is OpenHands' own override
+        // (read at LLM-validation time) so the model runs with its real window.
+        psi.Environment["ALLOW_SHORT_CONTEXT_WINDOWS"] = "true";
+
         _process = new Process { StartInfo = psi, EnableRaisingEvents = true };
         _process.OutputDataReceived += (_, e) => { if (e.Data != null) Log(e.Data); };
         _process.ErrorDataReceived += (_, e) => { if (e.Data != null) Log(e.Data); };

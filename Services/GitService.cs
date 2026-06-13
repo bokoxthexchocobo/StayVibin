@@ -74,6 +74,18 @@ public static class GitService
         return null;
     }
 
+    /// <summary>
+    /// Sign out of GitHub (github.com) via gh. Runs headlessly; returns whether it
+    /// succeeded plus any message (gh's error text on failure, e.g. when multiple
+    /// accounts require an explicit --user).
+    /// </summary>
+    public static async Task<(bool ok, string message)> GhLogoutAsync()
+    {
+        if (!GhAvailable) return (false, "GitHub CLI (gh) is not installed.");
+        var (ok, output) = await RunAsync("gh", "auth logout --hostname github.com", null);
+        return (ok, output.Trim());
+    }
+
     /// <summary>Turn an origin URL into "owner/repo" for display, or null.</summary>
     private static string? ParseSlug(string url)
     {
