@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.IO;
 using System.Net.Http;
 using System.Text.Json;
 
@@ -7,6 +8,12 @@ namespace StayVibin.Services;
 /// <summary>Metadata read from Ollama's /api/show.</summary>
 public sealed record ModelInfo(
     long ContextLength, string Family, string ParameterSize, IReadOnlyList<string> Capabilities);
+
+/// <summary>An installed model and its on-disk size (from /api/tags).</summary>
+public sealed record InstalledModel(string Name, long SizeBytes);
+
+/// <summary>Streaming progress for a model download (from /api/pull).</summary>
+public sealed record PullProgress(string Status, long Completed, long Total, double Percent);
 
 /// <summary>
 /// Read-only client for the local Ollama instance: lists installed models and
@@ -26,6 +33,12 @@ public sealed class OllamaClient : IDisposable
     // per call to avoid socket churn / port exhaustion. Per-call deadlines are
     // applied with a linked CancellationTokenSource where a tighter bound is wanted.
     private readonly HttpClient _opHttp = new() { Timeout = TimeSpan.FromSeconds(180) };
+
+    // Dedicated client for model downloads. A pull can stream for many minutes, so
+    // it must not be subject to a fixed timeout; the caller's CancellationToken is
+    // the only way it ends early. We read response headers first, then stream the
+    // newline-delimited progress body without a deadline.
+    private readonly HttpClient _pullHttp = new() { Timeout = System.Threading.Timeout.InfiniteTimeSpan };
 
     // Only successful lookups are stored; a missing entry means "not fetched yet".
     private readonly ConcurrentDictionary<string, ModelInfo> _infoCache =
@@ -159,7 +172,7 @@ public sealed class OllamaClient : IDisposable
     /// <summary>
     /// Probe whether a model returns STRUCTURED tool calls. Some Ollama models
     /// (notably qwen2.5-coder) advertise a "tools" capability but emit the call as
-    /// plain-text JSON in message.content instead of message.tool_calls. OpenHands
+    /// plain-text JSON in message.content instead of message.tool_calls. The engine
     /// cannot act on that, so the agent silently "does nothing" and the raw JSON
     /// shows up as gibberish in chat. We send one tiny tools request and report
     /// whether the model put the call where it belongs. Result is cached per model.
@@ -244,6 +257,134 @@ public sealed class OllamaClient : IDisposable
         catch { /* warm-up is best-effort */ }
     }
 
+    /// <summary>
+    /// List installed models together with their on-disk size in bytes (from
+    /// /api/tags). Used by the Model Store to show what is installed and how much
+    /// space each model takes. Returns empty on failure.
+    /// </summary>
+    public async Task<IReadOnlyList<InstalledModel>> ListInstalledAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            using var resp = await _http.GetAsync($"{_baseUrl}/api/tags", ct);
+            if (!resp.IsSuccessStatusCode) return Array.Empty<InstalledModel>();
+
+            using var stream = await resp.Content.ReadAsStreamAsync(ct);
+            using var doc = await JsonDocument.ParseAsync(stream, cancellationToken: ct);
+
+            if (!doc.RootElement.TryGetProperty("models", out var models)
+                || models.ValueKind != JsonValueKind.Array)
+                return Array.Empty<InstalledModel>();
+
+            var list = new List<InstalledModel>();
+            foreach (var m in models.EnumerateArray())
+            {
+                if (!m.TryGetProperty("name", out var n) || n.ValueKind != JsonValueKind.String)
+                    continue;
+                var name = n.GetString();
+                if (string.IsNullOrWhiteSpace(name)) continue;
+
+                long size = m.TryGetProperty("size", out var s) && s.ValueKind == JsonValueKind.Number
+                    ? s.GetInt64()
+                    : 0;
+                list.Add(new InstalledModel(name!, size));
+            }
+            list.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
+            return list;
+        }
+        catch
+        {
+            return Array.Empty<InstalledModel>();
+        }
+    }
+
+    /// <summary>
+    /// Download (install) a model via /api/pull, reporting streaming progress. The
+    /// response is a stream of newline-delimited JSON status objects; we forward each
+    /// as a <see cref="PullProgress"/>. Returns true if the pull reached "success".
+    /// Throws on a reported error or transport failure so the caller can surface it.
+    /// </summary>
+    public async Task<bool> PullModelAsync(
+        string model, IProgress<PullProgress>? progress, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(model))
+            throw new ArgumentException("Model name is required.", nameof(model));
+
+        var json = $"{{\"model\":{JsonSerializer.Serialize(model)},\"stream\":true}}";
+        using var req = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/api/pull")
+        {
+            Content = new StringContent(json, System.Text.Encoding.UTF8, "application/json")
+        };
+
+        using var resp = await _pullHttp.SendAsync(
+            req, HttpCompletionOption.ResponseHeadersRead, ct);
+        if (!resp.IsSuccessStatusCode)
+        {
+            var err = await resp.Content.ReadAsStringAsync(ct);
+            throw new InvalidOperationException(
+                $"Install failed ({(int)resp.StatusCode}): {err}");
+        }
+
+        using var stream = await resp.Content.ReadAsStreamAsync(ct);
+        using var reader = new StreamReader(stream);
+
+        bool success = false;
+        string? line;
+        while ((line = await reader.ReadLineAsync(ct)) is not null)
+        {
+            if (string.IsNullOrWhiteSpace(line)) continue;
+
+            string status;
+            long total = 0, completed = 0;
+            try
+            {
+                using var doc = JsonDocument.Parse(line);
+                var root = doc.RootElement;
+
+                if (root.TryGetProperty("error", out var e) && e.ValueKind == JsonValueKind.String)
+                    throw new InvalidOperationException(e.GetString());
+
+                status = root.TryGetProperty("status", out var s) && s.ValueKind == JsonValueKind.String
+                    ? s.GetString() ?? ""
+                    : "";
+                if (root.TryGetProperty("total", out var t) && t.ValueKind == JsonValueKind.Number)
+                    total = t.GetInt64();
+                if (root.TryGetProperty("completed", out var c) && c.ValueKind == JsonValueKind.Number)
+                    completed = c.GetInt64();
+            }
+            catch (JsonException)
+            {
+                continue;   // ignore a malformed progress line, keep streaming
+            }
+
+            double percent = total > 0 ? Math.Clamp(100.0 * completed / total, 0, 100) : 0;
+            progress?.Report(new PullProgress(status, completed, total, percent));
+
+            if (status.Equals("success", StringComparison.OrdinalIgnoreCase))
+                success = true;
+        }
+        return success;
+    }
+
+    /// <summary>
+    /// Remove (uninstall) a model via /api/delete. Returns true on success. DELETE
+    /// with a body requires an explicit HttpRequestMessage.
+    /// </summary>
+    public async Task<bool> DeleteModelAsync(string model, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(model)) return false;
+
+        var json = $"{{\"model\":{JsonSerializer.Serialize(model)}}}";
+        using var req = new HttpRequestMessage(HttpMethod.Delete, $"{_baseUrl}/api/delete")
+        {
+            Content = new StringContent(json, System.Text.Encoding.UTF8, "application/json")
+        };
+        // Use the long-lived client (180s): removing a large model can touch many
+        // blob files and occasionally exceeds the 4s metadata timeout on _http.
+        using var resp = await _opHttp.SendAsync(req, ct);
+        return resp.IsSuccessStatusCode;
+    }
+
     /// <summary>Forget cached metadata so the next lookup re-queries Ollama (used by Refresh).</summary>
     public void ClearCache()
     {
@@ -255,5 +396,6 @@ public sealed class OllamaClient : IDisposable
     {
         _http.Dispose();
         _opHttp.Dispose();
+        _pullHttp.Dispose();
     }
 }

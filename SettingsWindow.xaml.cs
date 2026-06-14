@@ -64,8 +64,8 @@ public partial class SettingsWindow : Window
             ReasoningBox.IsEnabled = false;
             CondenserBox.IsEnabled = false;
             NonNativeBox.IsEnabled = false;
-            ShowError("No saved model config found (~/.openhands/agent_settings.json). "
-                      + "Run the OpenHands CLI once to configure a model; app settings below still apply.");
+            ShowError("No saved model config found yet. "
+                      + "Start StayVibin once and pick a model on first run; app settings below still apply.");
         }
 
         // Refresh GitHub status when the window opens and whenever it regains focus

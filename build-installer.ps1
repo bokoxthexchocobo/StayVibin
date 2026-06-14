@@ -62,7 +62,7 @@ function Ensure-InnoCompiler {
 
 Push-Location $Root
 try {
-    $csproj = Join-Path $Root "OpenHandsDesktop.csproj"
+    $csproj = Join-Path $Root "StayVibin.csproj"
     if (-not $Version) { $Version = Get-ProjectVersion $csproj }
     Write-Host "Building StayVibin v$Version"
 

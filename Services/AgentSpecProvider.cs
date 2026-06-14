@@ -4,7 +4,7 @@ using System.Text.Json.Nodes;
 namespace StayVibin.Services;
 
 /// <summary>
-/// Loads the serialized Agent spec that the OpenHands CLI persists in
+/// Loads the serialized Agent spec that StayVibin's engine persists in
 /// ~/.openhands/agent_settings.json and prepares it for the agent-server.
 /// </summary>
 public static class AgentSpecProvider
@@ -18,6 +18,34 @@ public static class AgentSpecProvider
         "You are a capable, autonomous software engineering agent with FULL access "
         + "to the user's machine through your tools (terminal, file editor, search). "
         + "Operating rules:\n"
+        + "- Your primary tools are: 'terminal' (run a Windows PowerShell command), "
+        + "'file_editor' (view/create/edit files), 'grep' (search file CONTENTS by "
+        + "regex), 'glob' (find files by name/path pattern), 'task_tracker' (your "
+        + "to-do list), 'think', and 'finish'. Common synonyms are accepted and "
+        + "routed automatically, so you will NOT get a 'tool not found' error for "
+        + "them: 'search' -> grep, 'find' -> glob, and "
+        + "'bash'/'shell'/'cmd'/'powershell'/'execute_bash'/'execute_powershell'/"
+        + "'run_command' -> terminal. There is still NO separate 'read_file', "
+        + "'write_file', 'edit_file', 'str_replace', 'codebase_search', or 'python' "
+        + "tool - use 'file_editor' to read or change files and 'grep' to search "
+        + "code. To search file CONTENTS use 'grep'; to find files by NAME use "
+        + "'glob'; to read or change a file use 'file_editor'; to run a shell command "
+        + "use 'terminal'.\n"
+        + "- grep/glob 'path' rules (IMPORTANT - getting this wrong is the #1 reason a "
+        + "search 'finds nothing'): the search is rooted at your working directory. To "
+        + "search the WHOLE project, OMIT the 'path' argument entirely - that is the "
+        + "most reliable option. To limit the search, pass a folder under the working "
+        + "directory, e.g. path='src' or path='src/playsim', or an absolute path. Do "
+        + "NOT pass paths that climb out of the project. If a search returns nothing, "
+        + "do NOT immediately repeat the exact same search - widen it: drop the 'path' "
+        + "to scan the whole project, simplify the pattern, or try a related term. "
+        + "Never run the identical grep/glob call twice in a row.\n"
+        + "- Web access: to clone or pull a GitHub repo, use the 'terminal' tool with "
+        + "'git clone <url>' or 'gh repo clone owner/name'. To read a web page, if "
+        + "'browser_navigate'/'browser_get_content' tools are available use them "
+        + "(navigate to the URL, then get the page content); otherwise fetch with "
+        + "'terminal' via 'Invoke-WebRequest <url>'. Only browse when the task needs "
+        + "live web data - do not browse for things you can answer from the repo.\n"
         + "- You CAN read, list, and search every file in the working directory. "
         + "NEVER tell the user you are unable to access the filesystem or that the "
         + "environment is blocked, broken, or read-only. It is not.\n"
@@ -29,6 +57,12 @@ public static class AgentSpecProvider
         + "'findstr /s', which are slow and scan .git and binaries.\n"
         + "\n"
         + "Windows PowerShell terminal - follow these exactly to avoid jamming the shell:\n"
+        + "- To run a shell command, prefer the tool named exactly 'terminal'. The "
+        + "synonyms 'execute_powershell', 'powershell', 'bash', 'shell', 'cmd', "
+        + "'run_command', and 'execute_bash' are also accepted and routed to the same "
+        + "terminal, so they will not error - but 'terminal' is the canonical name. "
+        + "The terminal already runs commands in Windows PowerShell, so put your "
+        + "PowerShell command in its 'command' argument.\n"
         + "- This machine runs Windows PowerShell. Chain commands with ';' - NEVER use "
         + "'&&' or '||'. They are parse errors in PowerShell ('the token && is not a "
         + "valid statement separator') and they break the command wrapper, which jams "
@@ -181,7 +215,7 @@ public static class AgentSpecProvider
 
     /// <summary>
     /// Write a fresh agent_settings.json for a local OpenAI-compatible provider
-    /// (currently Ollama) so first-run users never have to run the OpenHands CLI.
+    /// (currently Ollama) so first-run users never have to configure the engine by hand.
     /// The schema mirrors what the CLI persists; only the model and base URL vary.
     /// </summary>
     public static void CreateDefault(string model, string providerBaseUrl, string? path = null)
@@ -196,9 +230,17 @@ public static class AgentSpecProvider
         var spec = new JsonObject
         {
             ["llm"] = BuildLlm(modelField, baseUrl, "agent"),
+            // No task_tool_set: that tool lets the agent spawn SUBAGENTS, and local
+            // models drive them poorly - the subagent returns empty responses and the
+            // stuck-detector kills the whole turn (the "planned then did nothing"
+            // symptom). The main agent does the work directly instead.
+            // grep (content search) and glob (filename search) are the search tools
+            // models reach for most; they ship with the engine but are not registered
+            // at server startup, so we also send their module qualnames on conversation
+            // creation (see PrepareConversationTools) to register them.
             ["tools"] = new JsonArray(
                 ToolNode("terminal"), ToolNode("file_editor"),
-                ToolNode("task_tracker"), ToolNode("task_tool_set")),
+                ToolNode("task_tracker"), ToolNode("grep"), ToolNode("glob")),
             ["filter_tools_regex"] = null,
             ["include_default_tools"] = new JsonArray("FinishTool", "ThinkTool"),
             ["agent_context"] = null,
@@ -228,6 +270,143 @@ public static class AgentSpecProvider
     private static JsonObject ToolNode(string name)
         => new() { ["name"] = name, ["params"] = new JsonObject() };
 
+    /// <summary>
+    /// Built-in engine tools that StayVibin enables but the agent-server does NOT
+    /// auto-register at startup (it only imports terminal/file_editor/task_tracker/
+    /// browser). To use one we must (a) list it in the agent spec's tools and (b)
+    /// tell the server which Python module to import so it registers - sent via the
+    /// conversation request's tool_module_qualnames map. Maps tool name -> module.
+    /// </summary>
+    private static readonly Dictionary<string, string> EngineSearchTools =
+        new(StringComparer.Ordinal)
+        {
+            ["grep"] = "openhands.tools.grep.definition",
+            ["glob"] = "openhands.tools.glob.definition",
+        };
+
+    /// <summary>
+    /// Full optional/alias map: the engine search tools above PLUS the synonym
+    /// aliases registered by our <see cref="EngineExtensions"/> module (e.g.
+    /// "search" -> grep, "execute_powershell" -> terminal). Used to (a) add the
+    /// alias tools the backend confirmed it registered, (b) strip any optional/alias
+    /// tool the backend does NOT have from the conversation spec, and (c) tell the
+    /// server which Python module to import to register each tool.
+    /// </summary>
+    private static readonly Dictionary<string, string> OptionalToolModules =
+        BuildOptionalToolModules();
+
+    private static Dictionary<string, string> BuildOptionalToolModules()
+    {
+        var map = new Dictionary<string, string>(EngineSearchTools, StringComparer.Ordinal);
+        foreach (var alias in EngineExtensions.AliasTools)
+            map[alias] = EngineExtensions.ModuleName;
+        // Web browsing. The browser toolset ships with the engine but is not
+        // auto-registered and is only USABLE when a Chromium/Chrome binary exists;
+        // the startup probe (list_usable_tools) gates it, so it is added to the spec
+        // only when it will actually work.
+        map["browser_tool_set"] = "openhands.tools.browser_use.definition";
+        return map;
+    }
+
+    // The tool names the running backend actually has registered, published by
+    // BackendManager after probing the engine at startup. Null until probed. We only
+    // enable optional/alias tools the server confirms, because an unregistered tool
+    // in the spec makes conversation creation fail. Volatile: written on a background
+    // probe thread, read when a conversation is created.
+    private static volatile HashSet<string>? _registeredTools;
+
+    /// <summary>Publish the set of tool names the backend has registered (from the probe).</summary>
+    public static void SetAvailableOptionalTools(IEnumerable<string> registeredToolNames)
+        => _registeredTools = new HashSet<string>(registeredToolNames, StringComparer.Ordinal);
+
+    /// <summary>
+    /// Ensure the spec lists the engine search tools (grep + glob). These are the
+    /// search primitives local models reach for most; adding them here means existing
+    /// saved configs (written before search tools existed) get them at load time too.
+    /// Synonym aliases are NOT written here - they are injected per-conversation by
+    /// <see cref="PrepareConversationTools"/> only when the backend confirms them.
+    /// </summary>
+    private static void AddSearchTools(JsonNode node)
+    {
+        if (node["tools"] is not JsonArray tools) return;
+
+        var present = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var t in tools)
+        {
+            var n = t?["name"]?.GetValue<string>();
+            if (!string.IsNullOrEmpty(n)) present.Add(n!);
+        }
+
+        foreach (var name in EngineSearchTools.Keys)
+            if (!present.Contains(name))
+                tools.Add(ToolNode(name));
+    }
+
+    /// <summary>
+    /// Finalize the spec's tool list for a new conversation and return the
+    /// module-import map for the server. Adds the optional/alias tools the backend
+    /// actually registered (probed at startup) and strips any optional/alias tool it
+    /// does NOT have, so the server never fails conversation creation on an
+    /// unregistered tool. The returned map tells the server which Python module to
+    /// import to register each optional/alias tool that remains in the spec.
+    /// </summary>
+    public static IReadOnlyDictionary<string, string> PrepareConversationTools(JsonNode spec)
+    {
+        var map = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (spec["tools"] is not JsonArray tools) return map;
+
+        var allowed = AllowedOptionalTools();
+
+        // Drop optional/alias tools the backend cannot provide this session.
+        for (int i = tools.Count - 1; i >= 0; i--)
+        {
+            var n = tools[i]?["name"]?.GetValue<string>();
+            if (!string.IsNullOrEmpty(n)
+                && OptionalToolModules.ContainsKey(n!)
+                && !allowed.Contains(n!))
+                tools.RemoveAt(i);
+        }
+
+        // Add allowed optional/alias tools that are not already listed.
+        var present = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var t in tools)
+        {
+            var n = t?["name"]?.GetValue<string>();
+            if (!string.IsNullOrEmpty(n)) present.Add(n!);
+        }
+        foreach (var name in allowed)
+            if (present.Add(name))
+                tools.Add(ToolNode(name));
+
+        // Build the import map for every optional/alias tool now in the spec.
+        foreach (var t in tools)
+        {
+            var n = t?["name"]?.GetValue<string>();
+            if (!string.IsNullOrEmpty(n) && OptionalToolModules.TryGetValue(n!, out var mod))
+                map[n!] = mod;
+        }
+        return map;
+    }
+
+    /// <summary>
+    /// Which optional/alias tools may be enabled this session. If the engine has been
+    /// probed, allow exactly the ones it registered; otherwise fall back to the
+    /// engine search tools (grep/glob) only - never the aliases - so we never enable
+    /// something the server might not have.
+    /// </summary>
+    private static HashSet<string> AllowedOptionalTools()
+    {
+        var probed = _registeredTools;
+        if (probed is null)
+            return new HashSet<string>(EngineSearchTools.Keys, StringComparer.Ordinal);
+
+        var set = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var name in OptionalToolModules.Keys)
+            if (probed.Contains(name))
+                set.Add(name);
+        return set;
+    }
+
     /// <summary>Build one LLM block matching the CLI's agent_settings.json schema.</summary>
     private static JsonObject BuildLlm(string modelField, string baseUrl, string usageId) => new()
     {
@@ -236,7 +415,7 @@ public static class AgentSpecProvider
         ["base_url"] = baseUrl,
         ["api_version"] = null,
         ["openrouter_site_url"] = "https://docs.all-hands.dev/",
-        ["openrouter_app_name"] = "OpenHands",
+        ["openrouter_app_name"] = "StayVibin",
         ["num_retries"] = 5,
         ["retry_multiplier"] = 8.0,
         ["retry_min_wait"] = 8,
@@ -257,9 +436,14 @@ public static class AgentSpecProvider
         ["log_completions_folder"] = "logs\\completions",
         ["native_tool_calling"] = true,
         ["reasoning_effort"] = "high",
-        ["enable_encrypted_reasoning"] = true,
-        ["prompt_cache_retention"] = "24h",
-        ["extended_thinking_budget"] = 200000,
+        // Local-safe defaults: these cloud-only reasoning options are stripped by
+        // NormalizeLocalLlm/SanitizeSavedSpec on every load anyway, so we write them
+        // already-clean. Otherwise the freshly created file is briefly inconsistent
+        // on disk and a stale agent-server reading the raw spec could pick up the
+        // encrypted-reasoning path that makes local models return empty responses.
+        ["enable_encrypted_reasoning"] = false,
+        ["prompt_cache_retention"] = null,
+        ["extended_thinking_budget"] = null,
         ["seed"] = null,
         ["usage_id"] = usageId,
         ["litellm_extra_body"] = new JsonObject()
@@ -287,16 +471,63 @@ public static class AgentSpecProvider
         path ??= DefaultSettingsPath();
         if (!File.Exists(path))
             throw new FileNotFoundException(
-                "No saved OpenHands agent settings found.\n" +
-                "Run the OpenHands CLI once to configure a model, then retry.", path);
+                "No saved agent settings found.\n" +
+                "Start StayVibin once and pick a model on first run, then retry.", path);
 
         var json = File.ReadAllText(path);
         var node = JsonNode.Parse(json)
             ?? throw new InvalidDataException("agent_settings.json is empty or invalid.");
 
         ApplyAccuracySettings(node);
+        NormalizeLocalLlm(node);
+        RemoveSubagentTools(node);
+        AddSearchTools(node);
         InjectAgentContext(node, workingDir, workspaceSnapshot, planMode);
         return node;
+    }
+
+    /// <summary>
+    /// Drop the delegation/subagent tool ("task_tool_set", surfaced as the "task"
+    /// tool) from a saved spec. Local models cannot reliably drive subagents: the
+    /// spawned subagent returns empty responses, OpenHands' stuck-detector trips, and
+    /// the whole turn halts after the agent only said "let's start by..." - looking
+    /// like it planned and then did nothing. Removing it keeps everything in the main
+    /// agent, which works. task_tracker (the to-do list) is intentionally kept.
+    /// </summary>
+    private static void RemoveSubagentTools(JsonNode node)
+    {
+        if (node["tools"] is not JsonArray tools) return;
+
+        for (int i = tools.Count - 1; i >= 0; i--)
+        {
+            var name = tools[i]?["name"]?.GetValue<string>();
+            if (name is "task_tool_set" or "task")
+                tools.RemoveAt(i);
+        }
+    }
+
+    /// <summary>
+    /// Strip cloud-only reasoning options from every LLM block before we send the
+    /// spec to a LOCAL provider (Ollama). enable_encrypted_reasoning, the extended
+    /// thinking budget, and prompt-cache retention are Anthropic/cloud features; on a
+    /// local OpenAI-compatible endpoint they are at best ignored and at worst cause
+    /// the SDK to round-trip reasoning in a shape the model returns empty for (the
+    /// "LLM response contained no tool call and no content" loop). reasoning_effort is
+    /// kept - Ollama maps it to its own think setting. Applies to the agent LLM and
+    /// the condenser LLM.
+    /// </summary>
+    private static void NormalizeLocalLlm(JsonNode node)
+    {
+        NormalizeOneLlm(node["llm"] as JsonObject);
+        NormalizeOneLlm((node["condenser"] as JsonObject)?["llm"] as JsonObject);
+
+        static void NormalizeOneLlm(JsonObject? llm)
+        {
+            if (llm is null) return;
+            llm["enable_encrypted_reasoning"] = false;
+            llm["extended_thinking_budget"] = null;
+            llm["prompt_cache_retention"] = null;
+        }
     }
 
     /// <summary>Same as <see cref="Load"/> but builds the workspace snapshot first.</summary>
@@ -328,14 +559,47 @@ public static class AgentSpecProvider
     public static string DescribeModel(JsonNode spec)
         => spec["llm"]?["model"]?.GetValue<string>() ?? "unknown model";
 
+    /// <summary>
+    /// Permanently clean a saved spec ON DISK: drop the subagent delegation tool and
+    /// strip cloud-only reasoning options. <see cref="Load"/> already does this in
+    /// memory, but older saved files keep <c>task_tool_set</c>, and the agent-server
+    /// can outlive the UI - so a stale conversation (or any raw read) could resurrect
+    /// the "delegate -> empty responses -> stuck" failure. Writing the cleaned spec
+    /// back makes the fix stick regardless of code path. Returns true if it changed
+    /// the file. Best-effort: never throws (startup must not fail over this).
+    /// </summary>
+    public static bool SanitizeSavedSpec(string? path = null)
+    {
+        try
+        {
+            path ??= DefaultSettingsPath();
+            if (!File.Exists(path)) return false;
+
+            var node = JsonNode.Parse(File.ReadAllText(path));
+            if (node is null) return false;
+
+            var before = node.ToJsonString();
+            RemoveSubagentTools(node);
+            NormalizeLocalLlm(node);
+            if (node.ToJsonString() == before) return false;
+
+            Save(node, path);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     /// <summary>Read the saved agent spec unmodified (for the settings editor).</summary>
     public static JsonNode LoadRaw(string? path = null)
     {
         path ??= DefaultSettingsPath();
         if (!File.Exists(path))
             throw new FileNotFoundException(
-                "No saved OpenHands agent settings found.\n" +
-                "Run the OpenHands CLI once to configure a model, then retry.", path);
+                "No saved agent settings found.\n" +
+                "Start StayVibin once and pick a model on first run, then retry.", path);
         return JsonNode.Parse(File.ReadAllText(path))
             ?? throw new InvalidDataException("agent_settings.json is empty or invalid.");
     }

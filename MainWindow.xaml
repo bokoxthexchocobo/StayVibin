@@ -51,6 +51,11 @@
                         <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
 
+                    <!-- Live agent status, centered in the top bar's flexible middle -->
+                    <TextBlock x:Name="StatusText" Grid.Column="1" Text="Stopped"
+                               Foreground="{StaticResource TextDim}" VerticalAlignment="Center"
+                               HorizontalAlignment="Center" FontSize="13"/>
+
                     <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
                         <Ellipse x:Name="StatusDot" Width="11" Height="11" Fill="{StaticResource Err}"
                                  VerticalAlignment="Center"/>
@@ -76,34 +81,15 @@
                                 Margin="6,0,0,0" VerticalAlignment="Center"
                                 Click="OnRefreshModels"
                                 ToolTip="Re-scan Ollama for installed models"/>
-                        <Button x:Name="ModelHelpButton" Content="?"
-                                Style="{StaticResource FlatButton}" Padding="9,3" FontSize="13"
-                                Margin="6,0,0,0" VerticalAlignment="Center"
-                                Click="OnModelRecommendations"
-                                ToolTip="Show recommended vibe-coding models by VRAM"/>
-                        <TextBlock Text="Plan" Foreground="{StaticResource TextDim}" FontSize="12"
-                                   VerticalAlignment="Center" Margin="16,0,8,0"/>
-                        <ComboBox x:Name="PlanModeCombo" Style="{StaticResource DarkCombo}"
-                                  MinWidth="92" VerticalAlignment="Center"
-                                  SelectionChanged="OnPlanModeChanged"
-                                  ToolTip="Plan Mode: have the agent plan and wait for your approval before making changes.&#x0a;Off = just do it. Ask = agent asks first. Auto = agent decides. Always = always plan first.">
-                            <ComboBoxItem Content="Off"/>
-                            <ComboBoxItem Content="Ask"/>
-                            <ComboBoxItem Content="Auto"/>
-                            <ComboBoxItem Content="Always"/>
-                        </ComboBox>
-                        <TextBlock Text="Perm" Foreground="{StaticResource TextDim}" FontSize="12"
-                                   VerticalAlignment="Center" Margin="16,0,8,0"/>
-                        <ComboBox x:Name="PermissionModeCombo" Style="{StaticResource DarkCombo}"
-                                  MinWidth="94" VerticalAlignment="Center"
-                                  SelectionChanged="OnPermissionModeChanged"
-                                  ToolTip="Permission mode: Ask pauses for risky/unknown actions. Allow all lets the agent proceed without prompts.">
-                            <ComboBoxItem Content="Ask"/>
-                            <ComboBoxItem Content="Allow all"/>
-                        </ComboBox>
                     </StackPanel>
 
                     <StackPanel Grid.Column="2" Orientation="Horizontal">
+                        <Button x:Name="ModelStoreButton" Content="Store" Style="{StaticResource FlatButton}"
+                                Click="OnModelStore" Margin="0,0,8,0"
+                                ToolTip="Install or remove local models with one click"/>
+                        <Button x:Name="HistoryToggle" Content="Chats" Style="{StaticResource FlatButton}"
+                                Click="OnToggleHistory" Margin="0,0,8,0"
+                                ToolTip="Show/hide the conversation history"/>
                         <Button x:Name="ExplorerToggle" Content="Files" Style="{StaticResource FlatButton}"
                                 Click="OnToggleExplorer" Margin="0,0,8,0"
                                 ToolTip="Show/hide the file explorer"/>
@@ -134,31 +120,55 @@
                 </Grid>
             </Border>
 
-            <!-- Usage / context strip -->
+            <!-- Session strip: agent modes (left) + context/status/telemetry -->
             <Border Background="{StaticResource Bg}" BorderBrush="{StaticResource Border}"
                     BorderThickness="0,0,0,1" Padding="16,8">
                 <Grid>
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="Auto"/>
-                        <ColumnDefinition Width="220"/>
                         <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
 
-                    <TextBlock Grid.Column="0" Text="Context" Foreground="{StaticResource TextDim}"
-                               FontSize="12" VerticalAlignment="Center" Margin="0,0,10,0"/>
-                    <ProgressBar x:Name="ContextBar" Grid.Column="1" Style="{StaticResource UsageBar}"
-                                 Value="0" VerticalAlignment="Center"/>
-                    <TextBlock x:Name="ContextText" Grid.Column="2" Text="-- / --"
-                               Foreground="{StaticResource TextDim}" FontSize="12"
-                               VerticalAlignment="Center" Margin="10,0,0,0"/>
+                    <!-- Agent behavior toggles -->
+                    <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center"
+                                Margin="0,0,18,0">
+                        <TextBlock Text="Plan" Foreground="{StaticResource TextDim}" FontSize="12"
+                                   VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <ComboBox x:Name="PlanModeCombo" Style="{StaticResource DarkCombo}"
+                                  MinWidth="84" VerticalAlignment="Center"
+                                  SelectionChanged="OnPlanModeChanged"
+                                  ToolTip="Plan Mode: have the agent plan and wait for your approval before making changes.&#x0a;Off = just do it. Ask = agent asks first. Auto = agent decides. Always = always plan first.">
+                            <ComboBoxItem Content="Off"/>
+                            <ComboBoxItem Content="Ask"/>
+                            <ComboBoxItem Content="Auto"/>
+                            <ComboBoxItem Content="Always"/>
+                        </ComboBox>
+                        <TextBlock Text="Perm" Foreground="{StaticResource TextDim}" FontSize="12"
+                                   VerticalAlignment="Center" Margin="14,0,8,0"/>
+                        <ComboBox x:Name="PermissionModeCombo" Style="{StaticResource DarkCombo}"
+                                  MinWidth="90" VerticalAlignment="Center"
+                                  SelectionChanged="OnPermissionModeChanged"
+                                  ToolTip="Permission mode: Ask pauses for risky/unknown actions. Allow all lets the agent proceed without prompts.">
+                            <ComboBoxItem Content="Ask"/>
+                            <ComboBoxItem Content="Allow all"/>
+                        </ComboBox>
+                    </StackPanel>
 
-                    <TextBlock x:Name="StatusText" Grid.Column="3" Text="Stopped"
-                               Foreground="{StaticResource TextDim}" VerticalAlignment="Center"
-                               HorizontalAlignment="Center" FontSize="13"/>
+                    <!-- Context usage -->
+                    <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                        <TextBlock Text="Context" Foreground="{StaticResource TextDim}"
+                                   FontSize="12" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                        <ProgressBar x:Name="ContextBar" Width="180" Style="{StaticResource UsageBar}"
+                                     Value="0" VerticalAlignment="Center"/>
+                        <TextBlock x:Name="ContextText" Text="-- / --"
+                                   Foreground="{StaticResource TextDim}" FontSize="12"
+                                   VerticalAlignment="Center" Margin="10,0,0,0"/>
+                    </StackPanel>
 
-                    <StackPanel Grid.Column="4" Orientation="Horizontal" VerticalAlignment="Center">
+                    <!-- Session telemetry -->
+                    <StackPanel Grid.Column="3" Orientation="Horizontal" VerticalAlignment="Center">
                         <TextBlock x:Name="TokensText" Text="Tokens: 0"
                                    Foreground="{StaticResource TextDim}" FontSize="12"/>
                         <TextBlock x:Name="CostText" Text="" Foreground="{StaticResource TextDim}"
@@ -183,16 +193,106 @@
 
         </StackPanel>
 
-        <!-- Main area: Explorer | (Editor | Chat) -->
+        <!-- Main area: Chats | Explorer | (Editor | Chat) -->
         <Grid Grid.Row="1">
             <Grid.ColumnDefinitions>
+                <ColumnDefinition x:Name="HistoryCol" Width="220" MinWidth="0"/>
+                <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition x:Name="ExplorerCol" Width="250" MinWidth="0"/>
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="*"/>
             </Grid.ColumnDefinitions>
 
-            <!-- File explorer -->
+            <!-- Conversation history -->
             <Border Grid.Column="0" Background="{StaticResource Panel}"
+                    BorderBrush="{StaticResource Border}" BorderThickness="0,0,1,0">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+
+                    <Grid Grid.Row="0" Margin="10,8,8,6">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="Chats" Foreground="{StaticResource TextDim}" FontSize="12"
+                                   FontWeight="SemiBold" VerticalAlignment="Center"/>
+                        <Button Grid.Column="1" x:Name="NewChatButton" Content="+ New"
+                                Style="{StaticResource FlatButton}" Padding="8,2" FontSize="11"
+                                Click="OnNewChat" IsEnabled="False"
+                                ToolTip="Start a fresh conversation"/>
+                    </Grid>
+
+                    <ListBox x:Name="ConversationList" Grid.Row="1" Background="Transparent"
+                             BorderThickness="0" Foreground="{StaticResource Text}"
+                             HorizontalContentAlignment="Stretch"
+                             ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                             SelectionChanged="OnConversationSelected">
+                        <ListBox.ItemContainerStyle>
+                            <Style TargetType="ListBoxItem">
+                                <Setter Property="Padding" Value="8,6"/>
+                                <Setter Property="Margin" Value="4,1"/>
+                                <Setter Property="Background" Value="Transparent"/>
+                                <Setter Property="Foreground" Value="{StaticResource Text}"/>
+                                <Setter Property="Template">
+                                    <Setter.Value>
+                                        <ControlTemplate TargetType="ListBoxItem">
+                                            <Border x:Name="RowBorder" CornerRadius="7"
+                                                    Background="{TemplateBinding Background}"
+                                                    Padding="{TemplateBinding Padding}">
+                                                <ContentPresenter/>
+                                            </Border>
+                                            <ControlTemplate.Triggers>
+                                                <Trigger Property="IsMouseOver" Value="True">
+                                                    <Setter TargetName="RowBorder" Property="Background"
+                                                            Value="{StaticResource PanelAlt}"/>
+                                                </Trigger>
+                                                <Trigger Property="IsSelected" Value="True">
+                                                    <Setter TargetName="RowBorder" Property="Background"
+                                                            Value="{StaticResource ToolBubble}"/>
+                                                </Trigger>
+                                            </ControlTemplate.Triggers>
+                                        </ControlTemplate>
+                                    </Setter.Value>
+                                </Setter>
+                            </Style>
+                        </ListBox.ItemContainerStyle>
+                        <ListBox.ItemTemplate>
+                            <DataTemplate DataType="{x:Type models:ConversationRow}">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel Grid.Column="0">
+                                        <TextBlock Text="{Binding DisplayTitle}"
+                                                   Foreground="{StaticResource Text}" FontSize="12.5"
+                                                   TextTrimming="CharacterEllipsis"/>
+                                        <TextBlock Text="{Binding Subtitle}"
+                                                   Foreground="{StaticResource TextDim}" FontSize="10.5"
+                                                   TextTrimming="CharacterEllipsis" Margin="0,1,0,0"/>
+                                    </StackPanel>
+                                    <Button Grid.Column="1" Content="&#x2715;" Tag="{Binding Id}"
+                                            Style="{StaticResource FlatButton}" Padding="6,2" FontSize="10"
+                                            VerticalAlignment="Center" Margin="6,0,0,0"
+                                            Click="OnDeleteConversation"
+                                            ToolTip="Delete this conversation"/>
+                                </Grid>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+                </Grid>
+            </Border>
+
+            <GridSplitter Grid.Column="1" Width="6" HorizontalAlignment="Center"
+                          VerticalAlignment="Stretch" Background="{StaticResource Border}"
+                          Cursor="SizeWE" ResizeBehavior="PreviousAndNext" ResizeDirection="Columns"
+                          ToolTip="Drag to resize the chat history"/>
+
+            <!-- File explorer -->
+            <Border Grid.Column="2" Background="{StaticResource Panel}"
                     BorderBrush="{StaticResource Border}" BorderThickness="0,0,1,0">
                 <Grid>
                     <Grid.RowDefinitions>
@@ -248,13 +348,13 @@
                 </Grid>
             </Border>
 
-            <GridSplitter Grid.Column="1" Width="6" HorizontalAlignment="Center"
+            <GridSplitter Grid.Column="3" Width="6" HorizontalAlignment="Center"
                           VerticalAlignment="Stretch" Background="{StaticResource Border}"
                           Cursor="SizeWE" ResizeBehavior="PreviousAndNext" ResizeDirection="Columns"
                           ToolTip="Drag to resize the explorer"/>
 
             <!-- Editor | Conversation -->
-            <Grid Grid.Column="2">
+            <Grid Grid.Column="4">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition x:Name="EditorCol" Width="0" MinWidth="0"/>
                     <ColumnDefinition Width="Auto"/>
@@ -314,30 +414,62 @@
                                 MaxWidth="820" HorizontalAlignment="Left"
                                 Background="{StaticResource AgentBubble}"
                                 BorderBrush="{StaticResource Border}" BorderThickness="1">
-                            <StackPanel>
-                                <TextBlock x:Name="Hdr" Text="{Binding Header}"
-                                           Foreground="{StaticResource TextDim}" FontSize="11"
-                                           FontWeight="SemiBold" Margin="0,0,0,4"
-                                           TextOptions.TextFormattingMode="Display"/>
-                                <TextBox Text="{Binding Text, Mode=OneWay}" IsReadOnly="True"
-                                         x:Name="Body"
-                                         Background="Transparent" BorderThickness="0"
-                                         Foreground="{StaticResource Text}"
-                                         TextWrapping="Wrap" Padding="0"
-                                         IsTabStop="False"
-                                         IsInactiveSelectionHighlightEnabled="True"
-                                         Cursor="IBeam"
-                                         PreviewMouseWheel="OnBodyMouseWheel"
-                                         VerticalScrollBarVisibility="Disabled"
-                                         HorizontalScrollBarVisibility="Disabled">
-                                    <TextBox.ContextMenu>
-                                        <ContextMenu>
-                                            <MenuItem Command="Copy" Header="Copy"/>
-                                            <MenuItem Command="SelectAll" Header="Select All"/>
-                                        </ContextMenu>
-                                    </TextBox.ContextMenu>
-                                </TextBox>
-                            </StackPanel>
+                            <Grid>
+                                <!-- Normal bubble: header + body (User/Agent/Tool/etc.) -->
+                                <StackPanel x:Name="NormalPanel">
+                                    <TextBlock x:Name="Hdr" Text="{Binding Header}"
+                                               Foreground="{StaticResource TextDim}" FontSize="11"
+                                               FontWeight="SemiBold" Margin="0,0,0,4"
+                                               TextOptions.TextFormattingMode="Display"/>
+                                    <TextBox Text="{Binding Text, Mode=OneWay}" IsReadOnly="True"
+                                             x:Name="Body"
+                                             Background="Transparent" BorderThickness="0"
+                                             Foreground="{StaticResource Text}"
+                                             TextWrapping="Wrap" Padding="0"
+                                             IsTabStop="False"
+                                             IsInactiveSelectionHighlightEnabled="True"
+                                             Cursor="IBeam"
+                                             PreviewMouseWheel="OnBodyMouseWheel"
+                                             VerticalScrollBarVisibility="Disabled"
+                                             HorizontalScrollBarVisibility="Disabled">
+                                        <TextBox.ContextMenu>
+                                            <ContextMenu>
+                                                <MenuItem Command="Copy" Header="Copy"/>
+                                                <MenuItem Command="SelectAll" Header="Select All"/>
+                                            </ContextMenu>
+                                        </TextBox.ContextMenu>
+                                    </TextBox>
+                                </StackPanel>
+
+                                <!-- Reasoning: a Cursor-style collapsible "Thinking" block.
+                                     Shown only for Thought items (see DataTriggers). -->
+                                <Expander x:Name="ThoughtPanel" Visibility="Collapsed"
+                                          IsExpanded="True" Foreground="{StaticResource TextDim}">
+                                    <Expander.Header>
+                                        <TextBlock Text="Thinking" FontSize="11" FontWeight="SemiBold"
+                                                   Foreground="{StaticResource TextDim}"
+                                                   TextOptions.TextFormattingMode="Display"/>
+                                    </Expander.Header>
+                                    <TextBox Text="{Binding Text, Mode=OneWay}" IsReadOnly="True"
+                                             x:Name="ThoughtBody"
+                                             Background="Transparent" BorderThickness="0"
+                                             Foreground="{StaticResource TextDim}" FontStyle="Italic"
+                                             TextWrapping="Wrap" Padding="0,4,0,0"
+                                             IsTabStop="False"
+                                             IsInactiveSelectionHighlightEnabled="True"
+                                             Cursor="IBeam"
+                                             PreviewMouseWheel="OnBodyMouseWheel"
+                                             VerticalScrollBarVisibility="Disabled"
+                                             HorizontalScrollBarVisibility="Disabled">
+                                        <TextBox.ContextMenu>
+                                            <ContextMenu>
+                                                <MenuItem Command="Copy" Header="Copy"/>
+                                                <MenuItem Command="SelectAll" Header="Select All"/>
+                                            </ContextMenu>
+                                        </TextBox.ContextMenu>
+                                    </TextBox>
+                                </Expander>
+                            </Grid>
                         </Border>
                         <DataTemplate.Triggers>
                             <DataTrigger Binding="{Binding Role}" Value="User">
@@ -346,8 +478,8 @@
                             </DataTrigger>
                             <DataTrigger Binding="{Binding Role}" Value="Thought">
                                 <Setter TargetName="Bubble" Property="Background" Value="{StaticResource Panel}"/>
-                                <Setter TargetName="Body" Property="Foreground" Value="{StaticResource TextDim}"/>
-                                <Setter TargetName="Body" Property="FontStyle" Value="Italic"/>
+                                <Setter TargetName="NormalPanel" Property="Visibility" Value="Collapsed"/>
+                                <Setter TargetName="ThoughtPanel" Property="Visibility" Value="Visible"/>
                             </DataTrigger>
                             <DataTrigger Binding="{Binding Role}" Value="Tool">
                                 <Setter TargetName="Bubble" Property="Background" Value="{StaticResource ToolBubble}"/>
@@ -386,17 +518,39 @@
                       Background="{StaticResource Border}" Visibility="Collapsed"
                       ToolTip="Drag to resize the panel below (input + server log)"/>
 
-        <!-- Bottom dock: plan approval banner + input + server log -->
+        <!-- Bottom dock: model suggestions + approval banners + input + server log -->
         <Grid Grid.Row="3">
             <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="*"/>
             </Grid.RowDefinitions>
 
-            <!-- Permission banner: shown when OpenHands pauses for risky-action approval -->
-            <Border x:Name="PermissionApprovalBar" Grid.Row="0" Visibility="Collapsed"
+            <!-- Model suggestion bar: one-click installs of better-suited models -->
+            <Border x:Name="ModelSuggestionBar" Grid.Row="0" Visibility="Collapsed"
+                    Background="{StaticResource PanelAlt}" BorderBrush="{StaticResource Accent}"
+                    BorderThickness="0,2,0,0" Padding="16,10">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Grid.Column="0" VerticalAlignment="Center" Margin="0,0,12,0">
+                        <TextBlock Text="Install a better-suited model"
+                                   Foreground="{StaticResource Text}" FontWeight="SemiBold" FontSize="13"/>
+                        <TextBlock Text="One click installs it via the Model Store - no commands needed."
+                                   Foreground="{StaticResource TextDim}" FontSize="11" Margin="0,2,0,0"/>
+                    </StackPanel>
+                    <!-- Install buttons are generated in code; Open Store / Dismiss are fixed -->
+                    <StackPanel x:Name="ModelSuggestionButtons" Grid.Column="1" Orientation="Horizontal"
+                                VerticalAlignment="Center"/>
+                </Grid>
+            </Border>
+
+            <!-- Permission banner: shown when the agent pauses for risky-action approval -->
+            <Border x:Name="PermissionApprovalBar" Grid.Row="1" Visibility="Collapsed"
                     Background="{StaticResource PanelAlt}" BorderBrush="{StaticResource Warn}"
                     BorderThickness="0,2,0,0" Padding="16,10">
                 <Grid>
@@ -427,7 +581,7 @@
             </Border>
 
             <!-- Plan approval banner: shown when the agent presents a plan and waits -->
-            <Border x:Name="PlanApprovalBar" Grid.Row="1" Visibility="Collapsed"
+            <Border x:Name="PlanApprovalBar" Grid.Row="2" Visibility="Collapsed"
                     Background="{StaticResource PanelAlt}" BorderBrush="{StaticResource Accent}"
                     BorderThickness="0,2,0,0" Padding="16,10">
                 <Grid>
@@ -454,7 +608,7 @@
             </Border>
 
             <!-- Input -->
-            <Border Grid.Row="2" Background="{StaticResource Panel}" BorderBrush="{StaticResource Border}"
+            <Border Grid.Row="3" Background="{StaticResource Panel}" BorderBrush="{StaticResource Border}"
                     BorderThickness="0,1,0,0" Padding="16,12">
             <Grid>
                 <Grid.RowDefinitions>
@@ -511,7 +665,7 @@
         </Border>
 
             <!-- Log strip + model capabilities -->
-            <Grid Grid.Row="3" Background="{StaticResource Panel}">
+            <Grid Grid.Row="4" Background="{StaticResource Panel}">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="Auto"/>

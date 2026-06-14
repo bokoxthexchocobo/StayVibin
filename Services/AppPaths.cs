@@ -21,8 +21,9 @@ public static class AppPaths
     }
 
     /// <summary>
-    /// One-time move of the pre-rename data folder (OpenHandsDesktop) to the new
-    /// StayVibin folder so existing settings/logs carry over. No-op afterwards.
+    /// One-time move of the old app data folder to the StayVibin folder so existing
+    /// settings/logs carry over. No-op afterwards. Keep the literal legacy folder
+    /// name above for backwards-compatible migration.
     /// </summary>
     private static void MigrateLegacy(string appData, string newDir)
     {
@@ -47,8 +48,26 @@ public static class AppPaths
         }
     }
 
+    /// <summary>
+    /// Stable folder where the agent-server persists conversations (state + event
+    /// logs). Passed to the server via OH_CONVERSATIONS_PATH so chats survive across
+    /// app restarts and are not tied to the server's transient launch directory.
+    /// </summary>
+    public static string ConversationsDir
+    {
+        get
+        {
+            var dir = Path.Combine(Root, "conversations");
+            Directory.CreateDirectory(dir);
+            return dir;
+        }
+    }
+
     public static string NewServerLogPath()
         => Path.Combine(LogsDir, $"server-{DateTime.Now:yyyyMMdd-HHmmss}.log");
+
+    public static string NewEngineLogPath()
+        => Path.Combine(LogsDir, $"engine-{DateTime.Now:yyyyMMdd-HHmmss}.log");
 
     public static string CrashLogPath => Path.Combine(LogsDir, "crash.log");
 }

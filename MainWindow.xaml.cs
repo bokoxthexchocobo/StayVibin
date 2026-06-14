@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Text.Json.Nodes;
 using System.Windows;
 using System.Windows.Controls;
@@ -26,6 +27,7 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<ChatItem> _chat = new();
     private AppSettings _settings = AppSettings.Load();
     private BackendManager _backend;
+    private StayVibinEngineManager? _engine;
     private AgentServerClient? _client;
 
     private string _workingDir;
@@ -34,6 +36,7 @@ public partial class MainWindow : Window
     private ChatItem? _streamingItem;
     private readonly System.Text.StringBuilder _streamRaw = new();   // raw stream before tool-syntax stripping
     private bool _streamStripMode;  // once tool markup is seen, re-strip the whole stream each delta
+    private bool _streamEnvelopeMode;  // once a JSON reply envelope is seen, show only its message
     private bool _turnUsedTools;    // true once the current turn invokes a tool or receives an observation
     private bool _turnAutoNudged;   // prevent infinite "continue and actually work" retries
     private string _lastAssistantText = "";
@@ -61,6 +64,14 @@ public partial class MainWindow : Window
     /// <summary>A user message waiting to be sent after the current turn finishes.</summary>
     private sealed record QueuedMessage(ChatItem Bubble, string Text, List<string> Images);
 
+    // Conversation history sidebar. Conversations are persisted by the agent-server;
+    // these rows mirror that list. _activeConversationId is the one currently open.
+    private readonly ObservableCollection<ConversationRow> _conversations = new();
+    private string? _activeConversationId;
+    private bool _suppressConvSelection;   // ignore ListBox selection we set in code
+    private string? _pendingTitleConvId;   // refresh the list once this new chat is titled
+    private bool _activeConvHadInput;      // did the user send anything in the active chat?
+
     private OllamaClient? _ollama;
     private JsonNode? _llmTemplate;     // detached clone of the configured LLM (for switches)
     private string? _selectedModel;     // ollama tag, e.g. "qwen2.5-coder:14b"
@@ -72,14 +83,20 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         ChatList.ItemsSource = _chat;
+        ConversationList.ItemsSource = _conversations;
 
         _backend = BuildBackend();
+        _engine = BuildEngineManager();
         _workingDir = _settings.EffectiveWorkingDir;
         WorkDirButton.Content = ShortPath(_workingDir);
         WorkDirButton.ToolTip = _workingDir;
 
         if (AgentSpecProvider.SettingsExist)
         {
+            // Permanently scrub legacy fields from the saved spec (subagent delegation
+            // tool + cloud-only reasoning options) so a stale config can never spawn a
+            // subagent that drives local models into the empty-response/stuck loop.
+            AgentSpecProvider.SanitizeSavedSpec();
             try
             {
                 var spec = AgentSpecProvider.Load();
@@ -110,9 +127,22 @@ public partial class MainWindow : Window
         CodeEditor.TextChanged += OnEditorTextChanged;
         CodeEditor.PreviewKeyDown += OnEditorKeyDown;
 
-        _ = PopulateModelsAsync();
+        _ = StartEngineAndPopulateModelsAsync();
         _ = UpdateRepoBadgeAsync();
         _ = RefreshTreeAsync();
+    }
+
+    private async Task StartEngineAndPopulateModelsAsync()
+    {
+        var engineOk = await EnsureOllamaRunningAsync();
+        await PopulateModelsAsync();
+
+        // EnsureOllamaRunningAsync leaves a "Starting StayVibin Engine..." status on
+        // the bar; clear it once startup finished so the user sees the app is idle
+        // and ready (no session is active yet at this point). On failure the error
+        // path already set a Down status, so leave that in place.
+        if (engineOk && !_agentRunning && _client is null)
+            SetStatus("Ready", AppDot.Idle);
     }
 
     /// <summary>
@@ -125,9 +155,83 @@ public partial class MainWindow : Window
 
         ModelInfo? info = _ollama is null ? null : await _ollama.GetModelInfoAsync(model);
         var notice = ModelAdvisor.Assess(model, info);
-        if (notice is null) return;
+        if (notice is null)
+        {
+            // Freshly assessed model is fine - clear any stale suggestion bar.
+            HideModelSuggestions();
+            return;
+        }
 
         AddSystem($"Model guidance ({notice.Severity}): {notice.Message}");
+        ShowModelSuggestions(notice.Suggestions);
+    }
+
+    /// <summary>
+    /// Show the in-chat suggestion bar with one-click Install buttons for the given
+    /// models (plus Open Store / Dismiss). Buttons are built dynamically so the set
+    /// of suggested models can vary by the selected model's size. Hidden when there
+    /// is nothing to suggest.
+    /// </summary>
+    private void ShowModelSuggestions(IReadOnlyList<string> models)
+    {
+        ModelSuggestionButtons.Children.Clear();
+
+        if (models is null || models.Count == 0)
+        {
+            ModelSuggestionBar.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        foreach (var model in models)
+        {
+            var btn = new Button
+            {
+                Content = "Install " + model,
+                Style = (Style)FindResource("AccentButton"),
+                Margin = new Thickness(0, 0, 8, 0),
+                ToolTip = $"Download {model} in the Model Store (no commands needed)",
+                Tag = model,
+            };
+            btn.Click += OnInstallSuggestion;
+            ModelSuggestionButtons.Children.Add(btn);
+        }
+
+        var store = new Button
+        {
+            Content = "Open Store",
+            Style = (Style)FindResource("FlatButton"),
+            Margin = new Thickness(0, 0, 8, 0),
+            ToolTip = "Browse and manage all models",
+        };
+        store.Click += async (_, _) => await OpenModelStoreAsync();
+        ModelSuggestionButtons.Children.Add(store);
+
+        var dismiss = new Button
+        {
+            Content = "Dismiss",
+            Style = (Style)FindResource("FlatButton"),
+            ToolTip = "Hide this suggestion",
+        };
+        dismiss.Click += (_, _) => HideModelSuggestions();
+        ModelSuggestionButtons.Children.Add(dismiss);
+
+        ModelSuggestionBar.Visibility = Visibility.Visible;
+    }
+
+    private void HideModelSuggestions()
+    {
+        ModelSuggestionBar.Visibility = Visibility.Collapsed;
+        ModelSuggestionButtons.Children.Clear();
+    }
+
+    /// <summary>Install button in the suggestion bar: open the store and pull it.</summary>
+    private async void OnInstallSuggestion(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button { Tag: string model } || string.IsNullOrWhiteSpace(model))
+            return;
+
+        HideModelSuggestions();
+        await OpenModelStoreAsync(model);
     }
 
     private async void OnWindowLoaded(object sender, RoutedEventArgs e)
@@ -182,21 +286,36 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
-    /// Verify the local Ollama server is reachable before starting a session. The
-    /// agent-server has no model backend without it, so we block Start and tell the
-    /// user how to fix it instead of failing deeper in the flow.
+    /// Start (or verify) the bundled StayVibin Engine before a session. The
+    /// agent-server has no model backend without an Ollama-compatible API, so we
+    /// bring up our engine first instead of asking the user to run a separate app.
     /// </summary>
     private async Task<bool> EnsureOllamaRunningAsync()
     {
         if (_ollama is null) _ollama = new OllamaClient(_settings.OllamaUrl);
 
-        SetStatus("Checking Ollama...", AppDot.Connecting);
+        if (StayVibinEngineManager.IsDefaultEngineUrl(_settings.OllamaUrl))
+        {
+            _engine ??= BuildEngineManager();
+            SetStatus("Starting StayVibin Engine...", AppDot.Connecting);
+            if (!await _engine.StartAsync(TimeSpan.FromSeconds(60)))
+            {
+                AddError($"StayVibin Engine is not reachable at {_settings.OllamaUrl}.\n"
+                         + $"Expected bundled engine at:\n{_engine.ExecutablePath}\n\n"
+                         + "Rebuild or reinstall StayVibin so the Engine folder is present.");
+                return false;
+            }
+        }
+        else
+        {
+            SetStatus("Checking model engine...", AppDot.Connecting);
+        }
+
         if (await _ollama.IsReachableAsync()) return true;
 
-        AddError($"Ollama is not reachable at {_settings.OllamaUrl}.\n"
-                 + "Start Ollama (run 'ollama serve', or launch the Ollama app) and make "
-                 + "sure at least one model is pulled, then press Start again. If Ollama "
-                 + "runs on a different host/port, update the URL in Settings.");
+        AddError($"The model engine is not reachable at {_settings.OllamaUrl}.\n"
+                 + "If you configured a custom engine URL, start that server and press Start "
+                 + "again. Otherwise reinstall StayVibin so the bundled engine is available.");
         return false;
     }
 
@@ -212,6 +331,9 @@ public partial class MainWindow : Window
         return b;
     }
 
+    private StayVibinEngineManager BuildEngineManager()
+        => new(contextLength: _settings.BackendContextLength);
+
     /// <summary>Tear down the old backend (unsubscribe log handler) and spawn a fresh one.</summary>
     private void RebuildBackend()
     {
@@ -220,12 +342,38 @@ public partial class MainWindow : Window
         _backend = BuildBackend();
     }
 
+    /// <summary>
+    /// Make sure the running server was launched in the current <see cref="_workingDir"/>.
+    /// The engine resolves relative grep/glob paths against the server's process
+    /// directory, so a mismatch (e.g. reopening a chat from another project) would
+    /// make relative searches miss. Relaunches the backend in place when needed.
+    /// </summary>
+    private async Task EnsureBackendInWorkingDirAsync()
+    {
+        if (_backend.IsRunning && PathsEqual(_backend.LaunchedWorkingDir, _workingDir))
+            return;
+        RebuildBackend();
+        _backend.WorkingDir = _workingDir;
+        await _backend.StartAsync(TimeSpan.FromSeconds(60));
+    }
+
+    /// <summary>Case-insensitive comparison of two filesystem paths (Windows).</summary>
+    private static bool PathsEqual(string? a, string? b)
+    {
+        if (string.IsNullOrWhiteSpace(a) || string.IsNullOrWhiteSpace(b)) return false;
+        static string Norm(string p) =>
+            Path.TrimEndingDirectorySeparator(Path.GetFullPath(p));
+        try { return string.Equals(Norm(a), Norm(b), StringComparison.OrdinalIgnoreCase); }
+        catch { return string.Equals(a, b, StringComparison.OrdinalIgnoreCase); }
+    }
+
     private async void OnSettingsClick(object sender, RoutedEventArgs e)
     {
         // Don't let settings (which can dispose/rebuild the backend) run while a
         // Start/Stop is mid-flight.
         if (_busy) return;
 
+        await EnsureOllamaRunningAsync();
         var models = _ollama is null
             ? (IReadOnlyList<string>)Array.Empty<string>()
             : await _ollama.ListModelsAsync();
@@ -243,8 +391,11 @@ public partial class MainWindow : Window
         if (_client is null)
         {
             // No active session: rebuild the backend so host/port/path/context apply,
-            // and refresh the default working dir.
+            // rebuild the engine so context/URL apply, and refresh the default
+            // working dir.
             RebuildBackend();
+            try { _engine?.Dispose(); } catch { }
+            _engine = BuildEngineManager();
 
             _workingDir = _settings.EffectiveWorkingDir;
             WorkDirButton.Content = ShortPath(_workingDir);
@@ -384,11 +535,29 @@ public partial class MainWindow : Window
         }
     }
 
-    /// <summary>Open the VRAM-tiered model recommendation guide without cluttering the main UI.</summary>
-    private void OnModelRecommendations(object sender, RoutedEventArgs e)
+    /// <summary>
+    /// Open the Model Store (one-click install/remove of local models). Reuses the
+    /// shared OllamaClient so cache state stays consistent. If the installed set
+    /// changed, re-scan so the dropdown reflects additions/removals immediately.
+    /// </summary>
+    private async void OnModelStore(object sender, RoutedEventArgs e)
+        => await OpenModelStoreAsync();
+
+    /// <summary>
+    /// Open the Model Store. When <paramref name="autoInstall"/> is set, the store
+    /// starts downloading that model on open (used by the in-chat Install buttons so
+    /// the user never has to touch a command line). Refreshes the model dropdown if
+    /// anything was installed or removed.
+    /// </summary>
+    private async Task OpenModelStoreAsync(string? autoInstall = null)
     {
-        var dlg = new ModelRecommendationsWindow { Owner = this };
+        if (_ollama is null) _ollama = new OllamaClient(_settings.OllamaUrl);
+
+        var dlg = new ModelStoreWindow(_ollama, autoInstall) { Owner = this };
         dlg.ShowDialog();
+
+        if (dlg.ModelsChanged)
+            await PopulateModelsAsync();
     }
 
     /// <summary>True for models that only do embeddings (no chat/completion).</summary>
@@ -667,51 +836,52 @@ public partial class MainWindow : Window
             AddError("agent-server.exe was not found at your configured path:\n"
                      + $"{_settings.EffectiveAgentServerPath}\n"
                      + "Fix or clear the path in Settings (clearing it lets StayVibin "
-                     + "install OpenHands automatically).");
+                     + "install the AI engine automatically).");
             return false;
         }
 
         var choice = MessageBox.Show(
             this,
-            "The OpenHands agent-server isn't installed yet.\n\n"
+            "StayVibin's AI engine isn't installed yet.\n\n"
             + "StayVibin can set it up for you automatically (it installs uv if needed, "
-            + "then runs 'uv tool install openhands'). This downloads OpenHands, needs "
-            + "an internet connection, and can take a few minutes.\n\nInstall it now?",
-            "Set up OpenHands?",
+            + "then downloads the engine). This needs an internet connection and can "
+            + "take a few minutes.\n\nInstall it now?",
+            "Set up StayVibin's AI engine?",
             MessageBoxButton.YesNo,
             MessageBoxImage.Question);
         if (choice != MessageBoxResult.Yes)
         {
-            AddSystem("OpenHands is not installed. You can install it later by pressing "
-                      + "Start again, or manually with 'uv tool install openhands'.");
+            AddSystem("The AI engine is not installed. You can install it later by "
+                      + "pressing Start again.");
             return false;
         }
 
-        SetStatus("Installing OpenHands...", AppDot.Connecting);
+        SetStatus("Installing AI engine...", AppDot.Connecting);
         SetActivity(true);   // show the activity bar during the long install
-        AddSystem("Setting up OpenHands agent-server (one-time install)...");
+        AddSystem("Setting up StayVibin's AI engine (one-time install)...");
 
-        var installer = new OpenHandsInstaller();
+        var installer = new StayVibinEngineInstaller();
         installer.LogLine += OnBackendLog;   // mirror install output into the server log
         try
         {
             bool ok = await installer.EnsureInstalledAsync();
             if (!ok)
             {
-                AddError("Automatic OpenHands setup failed - see the Server log for details. "
-                         + "You can also install it manually: uv tool install openhands");
+                AddError("Automatic setup of the AI engine failed - see the Server log "
+                         + "for details. You can also install it manually by running: "
+                         + "uv tool install openhands");
                 return false;
             }
 
             RebuildBackend();   // rebind to the freshly installed agent-server.exe
             if (!_backend.ExecutableExists)
             {
-                AddError("OpenHands installed but agent-server.exe still wasn't found at "
-                         + $"{_backend.ExecutablePath}. Set the path in Settings.");
+                AddError("The AI engine installed but agent-server.exe still wasn't found "
+                         + $"at {_backend.ExecutablePath}. Set the path in Settings.");
                 return false;
             }
 
-            AddSystem("OpenHands installed successfully.");
+            AddSystem("AI engine installed successfully.");
             return true;
         }
         finally
@@ -761,7 +931,7 @@ public partial class MainWindow : Window
 
             if (!await EnsureBackendInstalledAsync())
             {
-                SetStatus("OpenHands not installed", AppDot.Down);
+                SetStatus("AI engine not installed", AppDot.Down);
                 SetSessionActive(false);
                 return;
             }
@@ -786,6 +956,12 @@ public partial class MainWindow : Window
             // is null), so disposing any prior server is safe.
             if (_backendContext != _settings.ContextLength)
                 RebuildBackend();
+
+            // Launch the server inside the project folder so the engine's grep/glob
+            // resolve relative paths (e.g. "src") against the project, not the
+            // install dir. Without this every relative-path search the model tries
+            // fails and it burns the whole context window flailing.
+            _backend.WorkingDir = _workingDir;
 
             bool healthy = await _backend.StartAsync(TimeSpan.FromSeconds(60));
             if (!healthy)
@@ -824,26 +1000,276 @@ public partial class MainWindow : Window
     /// </summary>
     private async Task ConnectConversationAsync(JsonNode spec)
     {
+        // Before creating a new conversation, drop the previous one if it was never
+        // used, so unused Start/New/model-switch attempts don't leave empty chats.
+        await DiscardActiveIfEmptyAsync();
+
         SetStatus("Creating conversation...", AppDot.Connecting);
         _client = new AgentServerClient(_backend.BaseUrl);
-        _client.Update += OnAgentUpdate;
-        _client.StatusChanged += OnServerStatus;
-        _client.StatsUpdated += OnStats;
-        _client.CompactingStarted += OnCompactingStarted;
-        _client.Compacted += OnCompacted;
-        _client.Disconnected += OnDisconnected;
+        SubscribeClient(_client);
 
-        await _client.StartConversationAsync(spec, _workingDir, _settings.MaxIterations);
+        // Finalize the tool list for this conversation: add the optional/alias tools
+        // the backend actually registered (grep/glob plus synonyms like search ->
+        // grep, execute_powershell -> terminal) and strip any it does not have. The
+        // returned map tells the server which module to import to register each.
+        var toolModules = AgentSpecProvider.PrepareConversationTools(spec);
+        await _client.StartConversationAsync(spec, _workingDir, _settings.MaxIterations, toolModules);
         await _client.SetConfirmationPolicyAsync(ToAgentPermissionPolicy(_settings.PermissionMode));
         await _client.ConnectAsync();
 
+        _activeConversationId = _client.ConversationId;
+        _pendingTitleConvId = _client.ConversationId;   // pick up its title after turn 1
+        _activeConvHadInput = false;                    // fresh, empty conversation
         SetSessionActive(true);
         RefreshStatsDisplay();   // show configured runtime window before stats arrive
+        _ = RefreshConversationListAsync();
 
         // Pre-load the model in the background so the user's first message isn't stuck
         // behind a cold load. Warming at the resolved runtime context avoids a later
         // reload when the agent's first request uses that same num_ctx.
         _ = WarmSelectedModelAsync();
+    }
+
+    /// <summary>Wire the per-conversation client events to the UI handlers.</summary>
+    private void SubscribeClient(AgentServerClient c)
+    {
+        c.Update += OnAgentUpdate;
+        c.StatusChanged += OnServerStatus;
+        c.StatsUpdated += OnStats;
+        c.CompactingStarted += OnCompactingStarted;
+        c.Compacted += OnCompacted;
+        c.Disconnected += OnDisconnected;
+    }
+
+    // ---- conversation history (persisted chats) -----------------------------
+
+    /// <summary>Show/hide the conversation-history rail (mirrors the Files toggle).</summary>
+    private void OnToggleHistory(object sender, RoutedEventArgs e)
+        => HistoryCol.Width = HistoryCol.Width.Value > 0 ? new GridLength(0) : new GridLength(220);
+
+    /// <summary>
+    /// Reload the conversation list from the server (most recent first) and
+    /// re-highlight the active one. Best-effort; needs a running backend.
+    /// </summary>
+    private async Task RefreshConversationListAsync()
+    {
+        if (!_backend.IsRunning && !await _backend.IsHealthyAsync()) return;
+
+        var list = await AgentServerClient.ListConversationsAsync(_backend.BaseUrl);
+
+        _suppressConvSelection = true;
+        _conversations.Clear();
+        foreach (var c in list)
+        {
+            // Hide unused (empty) conversations, but always keep the active one so a
+            // freshly created chat stays visible/highlighted until its first message.
+            if (!c.HasUserMessage && c.Id != _activeConversationId) continue;
+            _conversations.Add(new ConversationRow
+            {
+                Id = c.Id,
+                Title = c.Title,
+                WorkingDir = c.WorkingDir,
+                UpdatedAt = c.UpdatedAt
+            });
+        }
+        _suppressConvSelection = false;
+
+        // Best-effort: prune abandoned empty conversations (no user message and not the
+        // active one) so they don't accumulate on disk across sessions. Fire-and-forget;
+        // they are already hidden above, this just reclaims the space.
+        foreach (var c in list)
+            if (!c.HasUserMessage && c.Id != _activeConversationId)
+                _ = AgentServerClient.DeleteConversationAsync(_backend.BaseUrl, c.Id);
+
+        HighlightActiveConversation();
+        NewChatButton.IsEnabled = true;
+    }
+
+    /// <summary>Select the row for the active conversation without triggering reopen.</summary>
+    private void HighlightActiveConversation()
+    {
+        _suppressConvSelection = true;
+        ConversationList.SelectedItem =
+            _conversations.FirstOrDefault(r => r.Id == _activeConversationId);
+        _suppressConvSelection = false;
+    }
+
+    /// <summary>Start a brand-new conversation (same as Start, but always fresh).</summary>
+    private async void OnNewChat(object sender, RoutedEventArgs e)
+    {
+        if (_busy) return;
+
+        // We need a running server. Common case: it is already up - this branch has no
+        // await before SetBusy, so two fast clicks can't both slip through.
+        bool serverUp = _backend.IsRunning || await _backend.IsHealthyAsync();
+        if (!serverUp)
+        {
+            // No server yet: defer to the normal Start flow, which launches it and
+            // creates a fresh conversation (_client is null, so Start won't toggle off).
+            OnStartClick(sender, e);
+            return;
+        }
+
+        if (_busy) return;   // re-check: an await above may have let another click in
+        SetBusy(true);
+        StartButton.IsEnabled = false;
+        try
+        {
+            await DisposeClientAsync();
+            ResetChatView();
+
+            var spec = await AgentSpecProvider.LoadAsync(_workingDir, _editorPath, planMode: _settings.PlanMode);
+            if (_selectedModel is not null) ApplyModel(spec, _selectedModel);
+            if (_settings.AutoTune) await AutoTuneSpecAsync(spec);
+            else await ApplyNativeToolCallingAsync(spec);
+
+            await ConnectConversationAsync(spec);
+            AddSystem($"New conversation. Working in {_workingDir}");
+        }
+        catch (Exception ex)
+        {
+            SetStatus("Error", AppDot.Down);
+            AddError($"Could not start a new conversation: {ex.Message}");
+            await DisposeClientAsync();
+            SetSessionActive(false);
+        }
+        finally
+        {
+            SetBusy(false);
+        }
+    }
+
+    /// <summary>Reopen a persisted conversation: replay its history then go live.</summary>
+    private async void OnConversationSelected(object sender, SelectionChangedEventArgs e)
+    {
+        if (_suppressConvSelection) return;
+        if (ConversationList.SelectedItem is not ConversationRow row) return;
+        // Re-selecting the live conversation is a no-op; but after Stop (_client null)
+        // clicking it should reopen.
+        if (row.Id == _activeConversationId && _client is not null) return;
+
+        if (_busy)
+        {
+            HighlightActiveConversation();   // revert selection; can't switch mid-op
+            return;
+        }
+        await OpenConversationAsync(row);
+    }
+
+    private async Task OpenConversationAsync(ConversationRow row)
+    {
+        SetBusy(true);
+        StartButton.IsEnabled = false;
+        SetStatus("Opening conversation...", AppDot.Connecting);
+        try
+        {
+            await DisposeClientAsync();
+            ResetChatView();
+
+            // Restore the conversation's working directory so the explorer and any new
+            // messages operate where this chat left off.
+            if (!string.IsNullOrWhiteSpace(row.WorkingDir) && Directory.Exists(row.WorkingDir))
+            {
+                _workingDir = row.WorkingDir;
+                WorkDirButton.Content = ShortPath(_workingDir);
+                WorkDirButton.ToolTip = _workingDir;
+                _ = RefreshTreeAsync();
+                _ = UpdateRepoBadgeAsync();
+            }
+
+            // The engine resolves relative grep/glob paths against the server's
+            // launch directory. If this chat's project differs from where the server
+            // is currently running, relaunch it there so relative searches work.
+            await EnsureBackendInWorkingDirAsync();
+
+            _client = new AgentServerClient(_backend.BaseUrl);
+            SubscribeClient(_client);
+            _client.AttachConversation(row.Id);
+
+            // Rebuild the transcript from persisted events, THEN open the socket (which
+            // streams only new events), so nothing is rendered twice.
+            await _client.ReplayHistoryAsync();
+            await _client.SetConfirmationPolicyAsync(ToAgentPermissionPolicy(_settings.PermissionMode));
+            await _client.ConnectAsync();
+
+            _activeConversationId = row.Id;
+            _pendingTitleConvId = null;
+            _activeConvHadInput = true;   // reopened chats already have content; keep them
+            SetSessionActive(true);
+            RefreshStatsDisplay();
+            HighlightActiveConversation();
+            AddSystem($"Reopened conversation. Working in {_workingDir}");
+            _ = WarmSelectedModelAsync();
+        }
+        catch (Exception ex)
+        {
+            SetStatus("Error", AppDot.Down);
+            AddError($"Could not open conversation: {ex.Message}");
+            await DisposeClientAsync();
+            SetSessionActive(false);
+        }
+        finally
+        {
+            SetBusy(false);
+        }
+    }
+
+    /// <summary>Delete a persisted conversation (with confirmation).</summary>
+    private async void OnDeleteConversation(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button btn || btn.Tag is not string id || string.IsNullOrEmpty(id))
+            return;
+
+        var confirm = MessageBox.Show(this,
+            "Delete this conversation permanently? This cannot be undone.",
+            "Delete conversation", MessageBoxButton.YesNo, MessageBoxImage.Warning);
+        if (confirm != MessageBoxResult.Yes) return;
+
+        var ok = await AgentServerClient.DeleteConversationAsync(_backend.BaseUrl, id);
+        if (!ok)
+        {
+            AddError("Could not delete the conversation (the server rejected the request).");
+            return;
+        }
+
+        // If we deleted the active conversation, tear down the live session too.
+        if (id == _activeConversationId)
+        {
+            await DisposeClientAsync();
+            ResetChatView();
+            _activeConversationId = null;
+            SetSessionActive(false);
+            SetStatus("Stopped", AppDot.Down);
+            AddSystem("Conversation deleted.");
+        }
+        await RefreshConversationListAsync();
+    }
+
+    /// <summary>
+    /// Delete the active conversation if the user never sent a message in it. A new
+    /// conversation is persisted the moment it is created, so without this every
+    /// Start/New/model-switch that goes unused would leave an empty "New chat" behind
+    /// (cluttering the list and growing the conversations folder). Safe because an
+    /// input-free conversation has no agent activity to lose. Best-effort.
+    /// </summary>
+    private async Task DiscardActiveIfEmptyAsync()
+    {
+        var id = _activeConversationId;
+        if (id is null || _activeConvHadInput) return;
+        _activeConversationId = null;
+        await AgentServerClient.DeleteConversationAsync(_backend.BaseUrl, id);
+    }
+
+    /// <summary>Clear the chat view and per-stream state for a fresh/reopened session.</summary>
+    private void ResetChatView()
+    {
+        _chat.Clear();
+        _streamingItem = null;
+        _lastAgentItem = null;
+        _streamRaw.Clear();
+        _streamStripMode = false;
+        _streamEnvelopeMode = false;
+        _lastAssistantText = "";
     }
 
     /// <summary>
@@ -885,6 +1311,7 @@ public partial class MainWindow : Window
         try
         {
             await DisposeClientAsync();   // drop the stale conversation + its registry
+            ResetChatView();              // the new conversation starts empty; clear the UI too
 
             var spec = await AgentSpecProvider.LoadAsync(_workingDir, _editorPath, planMode: _settings.PlanMode);
             ApplyModel(spec, model);
@@ -1358,6 +1785,9 @@ public partial class MainWindow : Window
         bool hasAttachments = _attachments.Count > 0;
         if ((text.Length == 0 && !hasAttachments) || _client is null || _busy) return;
 
+        // The conversation now has real content, so it must not be auto-discarded.
+        _activeConvHadInput = true;
+
         // A typed message is the operator's response to a pending plan (an approval
         // word or a change request), so dismiss the approval bar - the agent reads
         // the message and acts on it.
@@ -1411,6 +1841,7 @@ public partial class MainWindow : Window
         bool hasAttachments = _attachments.Count > 0;
         if ((text.Length == 0 && !hasAttachments) || _client is null) return;
 
+        _activeConvHadInput = true;   // real content; do not auto-discard this chat
         var shown = ComposeShown(text, hasAttachments);
         InputBox.Clear();
         AddItem(ChatRole.User, "You (steer)", shown);
@@ -1472,18 +1903,22 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
-    /// Check just the freshly appended tail of the stream for the start of a leaked
-    /// tool-call marker. The overlap (longest marker is "&lt;parameter=" at 11 chars)
-    /// ensures a marker split across two deltas is still detected.
+    /// Check just the freshly appended tail of the stream for the start of any marker
+    /// we must hide from the live bubble: a leaked tool-call tag (&lt;function=,
+    /// &lt;parameter=) or inlined reasoning (&lt;think&gt;, or a harmony control token
+    /// "&lt;|"). The overlap (longest marker is "&lt;parameter=" at 11 chars) ensures a
+    /// marker split across two deltas is still detected.
     /// </summary>
-    private bool TailHasToolMarker(int newChars)
+    private bool TailHasHiddenMarker(int newChars)
     {
         const int overlap = 12;
         int len = _streamRaw.Length;
         int from = Math.Max(0, len - newChars - overlap);
         var tail = _streamRaw.ToString(from, len - from);
         return tail.IndexOf("<function=", StringComparison.OrdinalIgnoreCase) >= 0
-            || tail.IndexOf("<parameter=", StringComparison.OrdinalIgnoreCase) >= 0;
+            || tail.IndexOf("<parameter=", StringComparison.OrdinalIgnoreCase) >= 0
+            || tail.IndexOf("<think>", StringComparison.OrdinalIgnoreCase) >= 0
+            || tail.IndexOf("<|", StringComparison.Ordinal) >= 0;
     }
 
     /// <summary>Start a fresh accounting window for the next agent turn.</summary>
@@ -1508,20 +1943,49 @@ public partial class MainWindow : Window
                 _lastAgentItem = _streamingItem;
                 _streamRaw.Clear();
                 _streamStripMode = false;
+                _streamEnvelopeMode = false;
             }
             _streamRaw.Append(u.Text);
 
-            // Fast path: until tool markup actually appears, append incrementally
-            // (cheap). Only a misbehaving model leaks <function=.../<parameter=...,
-            // and once it does we switch to re-stripping the whole stream each delta
-            // so the markup never shows. We scan only the tail (new chunk plus a
-            // small overlap) so detection stays O(1) per delta and still catches a
-            // marker split across two deltas.
-            if (!_streamStripMode && TailHasToolMarker(u.Text.Length))
+            // A model sometimes wraps its whole reply in a JSON envelope, e.g.
+            // {"message":"...","summary":"..."}. As soon as we recognize that shape,
+            // render only the extracted message so the braces/keys never flash. The
+            // final MessageEvent later replaces this with the authoritative answer.
+            if (!_streamStripMode)
+            {
+                var env = ChatText.StreamingEnvelopeProse(_streamRaw.ToString());
+                if (env is not null)
+                {
+                    _streamEnvelopeMode = true;
+                    _streamingItem.Text = env;
+                    ScrollToBottom();
+                    return;
+                }
+                if (_streamEnvelopeMode)
+                {
+                    // Was an envelope but the latest tail no longer matches; keep the
+                    // last good text rather than reverting to raw braces.
+                    ScrollToBottom();
+                    return;
+                }
+            }
+
+            // Fast path: until hidden markup actually appears, append incrementally
+            // (cheap). A misbehaving model leaks <function=.../<parameter=..., and a
+            // reasoning model inlines its chain-of-thought (<think>...</think> or the
+            // gpt-oss harmony "analysis" channel). Once any of those appears we switch
+            // to re-cleaning the whole stream each delta so neither tool plumbing nor
+            // raw reasoning syntax ever flashes in the live bubble - the reasoning is
+            // surfaced separately as a clean "Thinking" block by the final message. We
+            // scan only the tail (new chunk plus a small overlap) so detection stays
+            // O(1) per delta and still catches a marker split across two deltas.
+            if (!_streamStripMode && TailHasHiddenMarker(u.Text.Length))
                 _streamStripMode = true;
 
             if (_streamStripMode)
-                _streamingItem.Text = ChatText.Strip(_streamRaw.ToString());
+                // SplitReasoning's prose also strips tool markup, so this is a superset
+                // of Strip: it cleans tool syntax AND drops inlined reasoning.
+                _streamingItem.Text = ChatText.SplitReasoning(_streamRaw.ToString()).prose;
             else
                 _streamingItem.Append(u.Text);
 
@@ -1566,9 +2030,13 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
-    /// Detect the "model invented tool parameters" failure (pydantic rejects the
-    /// tool call with extra_forbidden / validation errors) and, after it repeats,
-    /// tell the user plainly that the model is likely too weak to drive the tools.
+    /// Detect the "model put extra fields in a tool call" failure (pydantic rejects
+    /// it with extra_forbidden / validation errors) and, after it repeats, explain
+    /// the real cause: the model is attaching fields the tool does not accept - most
+    /// often its own reasoning (gpt-oss emits an "analysis" channel) or invented
+    /// params like "reset". This is a formatting mismatch between the model's
+    /// tool-call output and the Ollama/runtime bridge, NOT a model-size problem
+    /// (big models hit it too). We suggest concrete, model-appropriate fixes.
     /// </summary>
     private void NoteToolSchemaError(string errorText)
     {
@@ -1581,12 +2049,65 @@ public partial class MainWindow : Window
 
         _weakModelWarned = true;
         var model = _selectedModel ?? "This model";
-        AddSystem(
-            $"Heads up: {model} keeps calling its tools with parameters they do not "
-            + "accept (a tool schema validation error). That almost always means the "
-            + "model is too small to use these tools correctly - it is not a bug in "
-            + "StayVibin or your setup. Switch to a larger model with strong tool "
-            + "support (for example qwen3:14b or gpt-oss:20b) for reliable results.");
+        bool wrongToolName = LooksLikeUnknownTool(errorText);
+        bool leaksReasoning = errorText.Contains("analysis", StringComparison.OrdinalIgnoreCase)
+            || model.Contains("gpt-oss", StringComparison.OrdinalIgnoreCase);
+
+        string msg;
+        if (wrongToolName)
+        {
+            // The model is calling a tool name that does not exist (e.g.
+            // 'execute_powershell'). The shell IS available - as the tool named
+            // 'terminal' - so this is the model mis-naming the tool, not a missing
+            // capability.
+            msg = $"Heads up: {model} keeps calling tools that do not exist (for example "
+                + "a separate \"powershell\" or \"bash\" tool). StayVibin's agent already "
+                + "has full PowerShell/CLI access through its built-in 'terminal' tool - "
+                + "the shell is not missing. The model is just naming the tool wrong, so "
+                + "its commands fail. This is a tool-calling reliability problem with the "
+                + "model, not your setup.";
+        }
+        else
+        {
+            msg = $"Heads up: {model} keeps adding fields to its tool calls that the tool "
+                + "does not accept (a schema validation error). This is a formatting "
+                + "mismatch between the model's tool-call output and the local runtime - "
+                + "not a model-size issue, and not a bug in your setup.";
+            if (leaksReasoning)
+                msg += " In this case the model is putting its internal reasoning (the "
+                    + "\"analysis\" channel) inside the tool call instead of in a separate "
+                    + "field. gpt-oss is known to do this through Ollama.";
+        }
+
+        msg += " The reliable fix is a model with clean native tool-calling - "
+            + SuggestCleanToolModels() + " behave well here. You can keep working; "
+            + "StayVibin retries automatically, but the run will be unreliable until the "
+            + "tool calls come through clean.";
+
+        AddSystem(msg);
+    }
+
+    /// <summary>True when the error is "the model called a tool that does not exist".</summary>
+    private static bool LooksLikeUnknownTool(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return false;
+        var s = text.ToLowerInvariant();
+        return s.Contains("not found") && (s.Contains("available:") || s.Contains("tool '"));
+    }
+
+    /// <summary>
+    /// A short list of models that drive the tools cleanly, excluding whatever model
+    /// is currently selected (so we never recommend the one that is failing).
+    /// </summary>
+    private string SuggestCleanToolModels()
+    {
+        string[] clean = ["qwen2.5-coder:14b", "qwen2.5-coder:32b", "qwen3:14b", "llama3.1:8b"];
+        var current = _selectedModel ?? "";
+        var picks = clean
+            .Where(m => !m.Equals(current, StringComparison.OrdinalIgnoreCase))
+            .Take(2)
+            .ToArray();
+        return picks.Length == 2 ? $"{picks[0]} or {picks[1]}" : string.Join(", ", picks);
     }
 
     /// <summary>True for tool-call schema validation errors (wrong/extra parameters).</summary>
@@ -1597,7 +2118,8 @@ public partial class MainWindow : Window
         return s.Contains("extra_forbidden")
             || s.Contains("extra inputs are not permitted")
             || s.Contains("validation error")
-            || s.Contains("error validating tool");
+            || s.Contains("error validating tool")
+            || (s.Contains("not found") && s.Contains("available:"));   // unknown tool name
     }
 
     private void OnServerStatus(string status)
@@ -1607,7 +2129,9 @@ public partial class MainWindow : Window
             bool running = s.Contains("running");
             bool waitingForPermission = s.Contains("waiting_for_confirmation");
             bool falling = _agentRunning && !running;   // a turn just finished
+            bool rising = !_agentRunning && running;    // a new turn just started
             SetRunning(running);
+            if (rising) _stuckNotifiedThisTurn = false; // arm stuck detection for this turn
             if (waitingForPermission)
             {
                 SetStatus("Waiting for permission", AppDot.Connecting);
@@ -1635,6 +2159,14 @@ public partial class MainWindow : Window
     {
         _ = UpdateRepoBadgeAsync();   // the agent may have committed/branched
         _ = RefreshTreeAsync();       // surface any files the agent changed
+
+        // A freshly created conversation gets its title auto-generated from the first
+        // user message; refresh the sidebar once so it stops showing "New chat".
+        if (_pendingTitleConvId is not null && _pendingTitleConvId == _activeConversationId)
+        {
+            _pendingTitleConvId = null;
+            _ = RefreshConversationListAsync();
+        }
 
         // A plan awaiting approval takes priority: show the Approve bar and stop
         // here (do not auto-continue or flush the queue while we wait on the user).
@@ -1689,7 +2221,7 @@ public partial class MainWindow : Window
         if (_settings.PermissionMode == PermissionMode.AllowAll) return;
         _permissionAwaitingApproval = true;
         PermissionText.Text =
-            "The agent wants to perform an action OpenHands marked as risky or unknown. "
+            "The agent wants to perform an action StayVibin marked as risky or unknown. "
             + "Review the last tool/action above, then allow it once, deny it, or switch to Allow all.";
         PermissionApprovalBar.Visibility = Visibility.Visible;
     }
@@ -1865,10 +2397,25 @@ public partial class MainWindow : Window
         var s = text.ToLowerInvariant();
         string[] promises =
         [
+            // "I'll / I will <act>"
             "i'll start", "i will start", "i'll begin", "i will begin",
             "i'll examine", "i will examine", "i'll review", "i will review",
             "i'll look", "i will look", "i'll check", "i will check",
+            "i'll inspect", "i will inspect", "i'll explore", "i will explore",
+            "i'll investigate", "i will investigate", "i'll analyze", "i will analyze",
+            "i'll go ahead", "i will go ahead",
+            // "I'm/I am going to <act>"
+            "i'm going to", "i am going to", "i'm gonna",
+            // "Let me <act>" - the common mistral/llama phrasing
+            "let me start", "let me begin", "let me examine", "let me review",
+            "let me look", "let me check", "let me inspect", "let me explore",
+            "let me investigate", "let me analyze", "let me open", "let me read",
+            "let me run", "let me take a look", "let me go ahead", "let me dig",
+            // "Let's <act>" / sequencing
+            "let's start", "let's begin", "let's take a look",
             "next, i'll", "next i will", "then i'll", "then i will",
+            "first, i'll", "first i'll", "first, i will", "to start, i",
+            // common stop-and-defer tails
             "if i find anything", "i'll provide feedback", "i will provide feedback",
             "let me know if there's anything specific", "let me know if there is anything specific"
         ];
@@ -2049,7 +2596,37 @@ public partial class MainWindow : Window
             if (LogBox.Text.Length > MaxLogChars)
                 LogBox.Text = LogBox.Text[^(MaxLogChars / 2)..];
             LogBox.ScrollToEnd();
+
+            DetectStuckLoop(line);
         });
+
+    // Set once per turn so the "got stuck" explanation is shown at most once even
+    // though the backend emits several related warning lines. Reset on each new turn.
+    private bool _stuckNotifiedThisTurn;
+
+    /// <summary>
+    /// Watch the backend log for the agent-server's stuck/empty-response signals. When
+    /// a local model keeps returning empty responses or repeats the same step, the
+    /// server's stuck detector halts the run - which otherwise looks to the user like
+    /// the agent silently stopped after saying "I'll do X". Surface a clear, honest
+    /// explanation (and what to try) instead of a silent stop.
+    /// </summary>
+    private void DetectStuckLoop(string line)
+    {
+        if (_stuckNotifiedThisTurn) return;
+
+        bool stuck = line.Contains("Stuck pattern detected", StringComparison.OrdinalIgnoreCase)
+                     || line.Contains("Action, Observation loop detected", StringComparison.OrdinalIgnoreCase);
+        if (!stuck) return;
+
+        _stuckNotifiedThisTurn = true;
+        AddSystem(
+            "The agent got stuck - the model kept returning empty responses or repeating the "
+            + "same step, so StayVibin stopped the run to avoid an endless loop. This is the "
+            + "model struggling with the task, not a crash. Try: rephrase or simplify the "
+            + "request, break it into smaller steps, or switch to a stronger tool-capable model "
+            + "in the Model Store. You can also just press Send again to retry.");
+    }
 
     // Height the bottom dock takes when the server log is expanded (remembered so
     // re-expanding restores whatever the user last dragged it to).
@@ -2438,6 +3015,7 @@ public partial class MainWindow : Window
         }
         _backend.LogLine -= OnBackendLog;
         try { _backend.Dispose(); } catch { }
+        try { _engine?.Dispose(); } catch { }
         try { _ollama?.Dispose(); } catch { }
         try { _flushLock.Dispose(); } catch { }
         try { _modelLoadLock.Dispose(); } catch { }

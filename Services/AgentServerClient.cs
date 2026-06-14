@@ -14,7 +14,12 @@ public sealed record AgentUpdate(ChatRole Role, string Header, string Text, bool
 /// <summary>Token/context usage snapshot from the server's stats stream.</summary>
 public sealed record UsageStats(long TotalTokens, long PerTurnTokens, long ContextWindow, double Cost);
 
-/// <summary>Operator approval mode translated to OpenHands confirmation policy.</summary>
+/// <summary>A persisted conversation as listed for the history sidebar.</summary>
+public sealed record ConversationSummary(
+    string Id, string Title, string WorkingDir, DateTime UpdatedAt, string Status,
+    bool HasUserMessage);
+
+/// <summary>Operator approval mode translated to the engine confirmation policy.</summary>
 public enum AgentPermissionPolicy
 {
     Ask,
@@ -22,7 +27,7 @@ public enum AgentPermissionPolicy
 }
 
 /// <summary>
-/// Talks to the OpenHands agent-server: creates conversations over REST and
+/// Talks to StayVibin's local AI engine: creates conversations over REST and
 /// streams events over a WebSocket. Raw server events are normalized into
 /// <see cref="AgentUpdate"/> records the UI can render directly.
 /// </summary>
@@ -30,6 +35,11 @@ public sealed class AgentServerClient : IDisposable
 {
     private readonly string _baseUrl;
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(30) };
+
+    // Shared client for server-level (not conversation-bound) calls: listing and
+    // deleting conversations for the history sidebar, which happen with no active
+    // conversation. Static so it is reused rather than allocated per call.
+    private static readonly HttpClient _sharedHttp = new() { Timeout = TimeSpan.FromSeconds(30) };
 
     private ClientWebSocket? _ws;
     private CancellationTokenSource? _wsCts;
@@ -54,10 +64,11 @@ public sealed class AgentServerClient : IDisposable
 
     /// <summary>
     /// Create a new conversation from a serialized Agent spec (the same JSON the
-    /// OpenHands CLI persists in ~/.openhands/agent_settings.json).
+    /// engine stores in ~/.openhands/agent_settings.json).
     /// </summary>
     public async Task<string> StartConversationAsync(
-        JsonNode agentSpec, string workingDir, int maxIterations = 500, CancellationToken ct = default)
+        JsonNode agentSpec, string workingDir, int maxIterations = 500,
+        IReadOnlyDictionary<string, string>? toolModules = null, CancellationToken ct = default)
     {
         var body = new JsonObject
         {
@@ -71,6 +82,16 @@ public sealed class AgentServerClient : IDisposable
             ["stuck_detection"] = true
         };
 
+        // Tell the server to dynamically import (register) any optional engine tools
+        // the spec references but that are not registered at startup (grep, glob).
+        // Without this the conversation create fails with "tool is not registered".
+        if (toolModules is { Count: > 0 })
+        {
+            var map = new JsonObject();
+            foreach (var kv in toolModules) map[kv.Key] = kv.Value;
+            body["tool_module_qualnames"] = map;
+        }
+
         using var resp = await _http.PostAsJsonAsync($"{_baseUrl}/api/conversations", body, ct);
         var text = await resp.Content.ReadAsStringAsync(ct);
         if (!resp.IsSuccessStatusCode)
@@ -80,6 +101,110 @@ public sealed class AgentServerClient : IDisposable
         ConversationId = doc.RootElement.GetProperty("id").GetString()
             ?? throw new InvalidOperationException("Server did not return a conversation id.");
         return ConversationId;
+    }
+
+    /// <summary>
+    /// List persisted conversations (most recent first) for the history sidebar.
+    /// Server-level call: works with no active conversation. Best-effort - returns
+    /// an empty list on any error.
+    /// </summary>
+    public static async Task<IReadOnlyList<ConversationSummary>> ListConversationsAsync(
+        string baseUrl, CancellationToken ct = default)
+    {
+        var result = new List<ConversationSummary>();
+        try
+        {
+            baseUrl = baseUrl.TrimEnd('/');
+            using var resp = await _sharedHttp.GetAsync(
+                $"{baseUrl}/api/conversations/search?limit=100&sort_order=CREATED_AT_DESC", ct);
+            if (!resp.IsSuccessStatusCode) return result;
+
+            var text = await resp.Content.ReadAsStringAsync(ct);
+            using var doc = JsonDocument.Parse(text);
+            if (!doc.RootElement.TryGetProperty("items", out var items)
+                || items.ValueKind != JsonValueKind.Array)
+                return result;
+
+            foreach (var item in items.EnumerateArray())
+            {
+                var id = GetString(item, "id");
+                if (string.IsNullOrEmpty(id)) continue;
+
+                var title = GetString(item, "title");
+                var workingDir = "";
+                if (item.TryGetProperty("workspace", out var ws) && ws.ValueKind == JsonValueKind.Object)
+                    workingDir = GetString(ws, "working_dir") ?? "";
+                var status = GetString(item, "execution_status") ?? "";
+                // last_user_message_id is set once the user sends a message, so a null
+                // value marks an unused (empty) conversation we can hide from the list.
+                var hasUserMessage = !string.IsNullOrEmpty(GetString(item, "last_user_message_id"));
+
+                DateTime updated = DateTime.MinValue;
+                var updatedRaw = GetString(item, "updated_at") ?? GetString(item, "created_at");
+                if (!string.IsNullOrEmpty(updatedRaw)
+                    && DateTime.TryParse(updatedRaw, null,
+                        System.Globalization.DateTimeStyles.RoundtripKind, out var dt))
+                    updated = dt;
+
+                result.Add(new ConversationSummary(
+                    id!, title ?? "", workingDir, updated, status, hasUserMessage));
+            }
+        }
+        catch { /* best-effort */ }
+        return result;
+    }
+
+    /// <summary>Permanently delete a persisted conversation. Returns true on success.</summary>
+    public static async Task<bool> DeleteConversationAsync(
+        string baseUrl, string id, CancellationToken ct = default)
+    {
+        try
+        {
+            baseUrl = baseUrl.TrimEnd('/');
+            using var resp = await _sharedHttp.DeleteAsync($"{baseUrl}/api/conversations/{id}", ct);
+            return resp.IsSuccessStatusCode;
+        }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// Bind this client to an existing persisted conversation (instead of creating a
+    /// new one) so it can replay history and reconnect the event socket.
+    /// </summary>
+    public void AttachConversation(string id) => ConversationId = id;
+
+    /// <summary>
+    /// Replay a persisted conversation's events (oldest first) through the normal
+    /// update pipeline so the chat UI is rebuilt exactly as it was. Call this BEFORE
+    /// <see cref="ConnectAsync"/>; the event socket then streams only NEW events
+    /// (default resend_mode=none), so nothing is rendered twice.
+    /// </summary>
+    public async Task ReplayHistoryAsync(CancellationToken ct = default)
+    {
+        if (ConversationId is null) return;
+
+        string? pageId = null;
+        do
+        {
+            var url = $"{_baseUrl}/api/conversations/{ConversationId}/events/search"
+                      + "?limit=100&sort_order=TIMESTAMP";
+            if (!string.IsNullOrEmpty(pageId))
+                url += "&page_id=" + Uri.EscapeDataString(pageId!);
+
+            using var resp = await _http.GetAsync(url, ct);
+            if (!resp.IsSuccessStatusCode) return;
+
+            var text = await resp.Content.ReadAsStringAsync(ct);
+            using var doc = JsonDocument.Parse(text);
+            var root = doc.RootElement;
+
+            if (root.TryGetProperty("items", out var items) && items.ValueKind == JsonValueKind.Array)
+                foreach (var item in items.EnumerateArray())
+                    HandleRawEvent(item.GetRawText(), replay: true);
+
+            pageId = GetString(root, "next_page_id");
+        }
+        while (!string.IsNullOrEmpty(pageId) && !ct.IsCancellationRequested);
     }
 
     /// <summary>Open the event WebSocket and begin streaming events in the background.</summary>
@@ -154,7 +279,7 @@ public sealed class AgentServerClient : IDisposable
     }
 
     /// <summary>
-    /// Configure OpenHands' built-in confirmation policy. Ask confirms HIGH and
+    /// Configure the engine's built-in confirmation policy. Ask confirms HIGH and
     /// UNKNOWN risk actions; AllowAll maps to NeverConfirm.
     /// </summary>
     public async Task SetConfirmationPolicyAsync(AgentPermissionPolicy policy, CancellationToken ct = default)
@@ -262,7 +387,7 @@ public sealed class AgentServerClient : IDisposable
         }
     }
 
-    private void HandleRawEvent(string json)
+    private void HandleRawEvent(string json, bool replay = false)
     {
         JsonDocument doc;
         try { doc = JsonDocument.Parse(json); }
@@ -278,16 +403,35 @@ public sealed class AgentServerClient : IDisposable
                 case "MessageEvent":
                 {
                     var (role, text) = ReadMessage(root);
-                    // Skip echoes of the user's own message (we render those locally).
-                    if (role == "user") return;
-                    // Strip any leaked tool-call markup before showing the message.
-                    text = ChatText.Strip(text);
-                    if (!string.IsNullOrWhiteSpace(text))
-                        Update?.Invoke(new AgentUpdate(ChatRole.Agent, "Assistant", text.Trim(), false));
+                    // Live: skip echoes of the user's own message (rendered locally).
+                    // Replay: there is no local echo, so render the user message so the
+                    // rebuilt transcript shows both sides of the conversation.
+                    if (role == "user")
+                    {
+                        if (replay && !string.IsNullOrWhiteSpace(text))
+                            Update?.Invoke(new AgentUpdate(ChatRole.User, "You", text.Trim(), false));
+                        return;
+                    }
+
+                    // The model's reasoning can arrive either as a dedicated field
+                    // (reasoning_content) or inlined into the message (<think> blocks,
+                    // gpt-oss analysis channel). Surface it as a clean, separate
+                    // "Thinking" block and keep only the real answer as the reply.
+                    var (prose, inlineReasoning) = ChatText.SplitReasoning(text);
+                    var reasoning = ReadReasoning(root);
+                    if (string.IsNullOrWhiteSpace(reasoning)) reasoning = inlineReasoning;
+
+                    if (!string.IsNullOrWhiteSpace(reasoning))
+                        Update?.Invoke(new AgentUpdate(ChatRole.Thought, "Thinking", reasoning.Trim(), false));
+                    if (!string.IsNullOrWhiteSpace(prose))
+                        Update?.Invoke(new AgentUpdate(ChatRole.Agent, "Assistant", prose.Trim(), false));
                     break;
                 }
                 case "StreamingDeltaEvent":
                 {
+                    // During replay the final MessageEvent already carries the full
+                    // text; replaying deltas too would duplicate it.
+                    if (replay) break;
                     var delta = GetString(root, "content");
                     if (!string.IsNullOrEmpty(delta))
                         Update?.Invoke(new AgentUpdate(ChatRole.Agent, "Assistant", delta!, true));
@@ -331,7 +475,10 @@ public sealed class AgentServerClient : IDisposable
                     // These events carry many key/value pairs (full_state,
                     // last_user_message_id, execution_status, stats, ...).
                     var key = GetString(root, "key");
-                    if (key == "execution_status")
+                    // During replay, skip execution_status: a persisted "running ->
+                    // finished" transition would otherwise fire the live turn-finished
+                    // logic (auto-continue, queue flush). Stats are still restored.
+                    if (key == "execution_status" && !replay)
                     {
                         var status = GetString(root, "value");
                         if (!string.IsNullOrWhiteSpace(status))
@@ -354,11 +501,11 @@ public sealed class AgentServerClient : IDisposable
                     break;
                 }
                 case "CondensationRequest":
-                    CompactingStarted?.Invoke();
+                    if (!replay) CompactingStarted?.Invoke();
                     break;
                 case "Condensation":
                 case "CondensationSummaryEvent":
-                    Compacted?.Invoke();
+                    if (!replay) Compacted?.Invoke();
                     break;
                 default:
                     // Ignore token-level / log / housekeeping events.
@@ -443,6 +590,21 @@ public sealed class AgentServerClient : IDisposable
         return (role, text);
     }
 
+    /// <summary>
+    /// Read a model's reasoning when the runtime separates it into its own field
+    /// (litellm/Ollama surface it as reasoning_content or reasoning on the message).
+    /// Returns markup-free text, or "" if there is none. Inlined reasoning that the
+    /// model wrote into the message body is handled separately by
+    /// <see cref="ChatText.SplitReasoning"/>.
+    /// </summary>
+    private static string ReadReasoning(JsonElement root)
+    {
+        if (!root.TryGetProperty("llm_message", out var msg) || msg.ValueKind != JsonValueKind.Object)
+            return "";
+        var raw = GetString(msg, "reasoning_content") ?? GetString(msg, "reasoning");
+        return string.IsNullOrWhiteSpace(raw) ? "" : ChatText.Strip(raw).Trim();
+    }
+
     /// <summary>Join the text from a content array like [{"type":"text","text":"..."}].</summary>
     private static string ExtractContentText(JsonElement parent, string prop)
     {
@@ -477,9 +639,15 @@ public sealed class AgentServerClient : IDisposable
 
         switch (tool.ToLowerInvariant())
         {
+            // "terminal" plus the synonym aliases routed to it (see EngineExtensions).
             case "terminal":
             case "execute_bash":
             case "bash":
+            case "shell":
+            case "cmd":
+            case "powershell":
+            case "execute_powershell":
+            case "run_command":
             {
                 var cmd = hasAction ? GetString(action, "command") : null;
                 return (ChatRole.Tool, "Run command",
@@ -513,6 +681,24 @@ public sealed class AgentServerClient : IDisposable
                 }
             }
 
+            case "grep":
+            case "search":   // alias -> grep
+            {
+                var pattern = hasAction ? GetString(action, "pattern") : null;
+                var inc = hasAction ? GetString(action, "include") : null;
+                var detail = string.IsNullOrWhiteSpace(pattern) ? "(no pattern)" : pattern!;
+                if (!string.IsNullOrWhiteSpace(inc)) detail += $"  (in {inc})";
+                return (ChatRole.Tool, "Search contents", detail);
+            }
+
+            case "glob":
+            case "find":     // alias -> glob
+            {
+                var pattern = hasAction ? GetString(action, "pattern") : null;
+                return (ChatRole.Tool, "Find files",
+                        string.IsNullOrWhiteSpace(pattern) ? "(no pattern)" : pattern!);
+            }
+
             case "task_tracker":
             case "task_tool_set":
                 return (ChatRole.Tool, "Plan", DescribeTasks(action, hasAction, sub));
@@ -530,6 +716,40 @@ public sealed class AgentServerClient : IDisposable
                 var m = hasAction ? GetString(action, "message") : null;
                 return (ChatRole.Tool, "Finished", m ?? "");
             }
+
+            // Web browsing toolset (browser_use). Narrate the common actions.
+            case "browser_navigate":
+            {
+                var url = hasAction ? GetString(action, "url") : null;
+                return (ChatRole.Tool, "Browse",
+                        string.IsNullOrWhiteSpace(url) ? "(navigate)" : "-> " + url!);
+            }
+            case "browser_get_content":
+            case "browser_get_state":
+                return (ChatRole.Tool, "Browse", "Read page content");
+            case "browser_click":
+            {
+                var idx = hasAction ? GetLong(action, "index") : 0;
+                return (ChatRole.Tool, "Browse", $"Click element #{idx}");
+            }
+            case "browser_type":
+            {
+                var t = hasAction ? GetString(action, "text") : null;
+                return (ChatRole.Tool, "Browse",
+                        string.IsNullOrWhiteSpace(t) ? "Type text" : "Type: " + Truncate(t!, 200));
+            }
+            case "browser_scroll":
+                return (ChatRole.Tool, "Browse", "Scroll page");
+            case "browser_go_back":
+                return (ChatRole.Tool, "Browse", "Go back");
+            case "browser_list_tabs":
+            case "browser_switch_tab":
+            case "browser_close_tab":
+            case "browser_get_storage":
+            case "browser_set_storage":
+            case "browser_start_recording":
+            case "browser_stop_recording":
+                return (ChatRole.Tool, "Browse", tool!.Replace("browser_", "").Replace('_', ' '));
 
             default:
                 return (ChatRole.Tool, $"Tool: {tool}", SummarizeActionFallback(root));

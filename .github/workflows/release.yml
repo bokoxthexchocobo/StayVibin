@@ -25,7 +25,7 @@ jobs:
       - name: Build installer
         shell: pwsh
         run: |
-          $version = (Select-Xml -Path OpenHandsDesktop.csproj -XPath '//Version').Node.InnerText.Trim()
+          $version = (Select-Xml -Path StayVibin.csproj -XPath '//Version').Node.InnerText.Trim()
           Write-Host "Version: $version"
           ./build-installer.ps1 -Version $version
 

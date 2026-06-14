@@ -40,8 +40,26 @@ public static class ModelTuning
         // regardless of vendor (DeepSeek, Qwen, Phi, future releases).
         bool isThinking = !isCoder && IsThinkingModel(name, info);
 
-        double temperature = isCoder ? 0.0 : isThinking ? 0.55 : 0.2;
-        const string reasoning = "high";
+        // Low temperatures favor accuracy and determinism, which is what an agentic
+        // coding tool needs. Coders run fully deterministic. Reasoning models keep a
+        // little headroom but well below a chat-style default: a high temperature on
+        // a reasoning model mostly adds noise and hallucination on factual code
+        // questions. gpt-oss does its reasoning in a dedicated channel, so a low
+        // sampling temperature improves answer accuracy without hurting its
+        // reasoning (and reduces the rambling that triggers empty-response loops).
+        double temperature =
+            isCoder ? 0.0
+            : name.Contains("gpt-oss") ? 0.1
+            : isThinking ? 0.3
+            : 0.2;
+        // Reasoning effort is model-aware. gpt-oss's harmony format treats "high"
+        // as deep-math mode: it spends the whole generation in its analysis
+        // channel and frequently ends a turn with NO final message and NO tool
+        // call, which makes the agent loop on "LLM response contained no tool call
+        // and no content". OpenAI's own guidance is low/medium reasoning for
+        // agentic tool use, so gpt-oss gets "medium" to keep it acting instead of
+        // over-thinking. Other reasoning models behave well with "high".
+        string reasoning = name.Contains("gpt-oss") ? "medium" : "high";
 
         // Explicit cap wins as-is. Otherwise "auto" uses the model's native window,
         // clamped to AutoContextCap (and to the 32k fallback when native is unknown).

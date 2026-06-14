@@ -22,7 +22,7 @@ public enum PlanMode
 
 /// <summary>
 /// Operator permission mode for potentially risky agent actions. Ask maps to the
-/// OpenHands confirmation policy; AllowAll maps to NeverConfirm.
+/// Engine confirmation policy; AllowAll maps to NeverConfirm.
 /// </summary>
 public enum PermissionMode
 {
@@ -41,8 +41,8 @@ public sealed class AppSettings
     public string Host { get; set; } = "127.0.0.1";
     /// <summary>TCP port for the agent-server.</summary>
     public int Port { get; set; } = 8000;
-    /// <summary>Base URL of the local Ollama instance.</summary>
-    public string OllamaUrl { get; set; } = "http://localhost:11434";
+    /// <summary>Base URL of the bundled StayVibin Engine (Ollama-compatible API).</summary>
+    public string OllamaUrl { get; set; } = StayVibinEngineManager.DefaultBaseUrl;
     /// <summary>Explicit agent-server.exe path; empty = auto-detect the uv install.</summary>
     public string AgentServerPath { get; set; } = "";
     /// <summary>Default working folder for new sessions; empty = user profile.</summary>
@@ -132,7 +132,16 @@ public sealed class AppSettings
         if (ContextLength is not 0 and < 1024) ContextLength = 0;
         if (MaxIterations < 1) MaxIterations = 500;
         if (string.IsNullOrWhiteSpace(Host)) Host = "127.0.0.1";
-        if (string.IsNullOrWhiteSpace(OllamaUrl)) OllamaUrl = "http://localhost:11434";
+        if (string.IsNullOrWhiteSpace(OllamaUrl) || IsLegacyDefaultOllamaUrl(OllamaUrl))
+            OllamaUrl = StayVibinEngineManager.DefaultBaseUrl;
         return this;
+    }
+
+    private static bool IsLegacyDefaultOllamaUrl(string url)
+    {
+        if (!Uri.TryCreate(url.TrimEnd('/'), UriKind.Absolute, out var u)) return false;
+        return (u.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase)
+                || u.Host.Equals("127.0.0.1", StringComparison.OrdinalIgnoreCase))
+               && u.Port == 11434;
     }
 }

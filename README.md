@@ -1,13 +1,10 @@
 # StayVibin
 
-A native Windows (WPF / .NET 10) GUI front-end for OpenHands - a local-first
-AI vibe-coding assistant.
+A native Windows (WPF / .NET 10) app for local-first AI vibe coding.
 
-It does **not** reimplement the agent. Instead it launches the existing OpenHands
-`agent-server` (a local FastAPI backend) as a child process and talks to it over
-REST + WebSocket - the same architecture the official OpenHands web app uses.
-This keeps all of OpenHands' model integrations, tools, and streaming while giving
-you a real native desktop app.
+StayVibin launches its local AI engine as a child process and talks to it over
+REST + WebSocket. That keeps the engine, tools, model integrations, and streaming
+local while giving you a real native desktop app.
 
 This project is standalone and intentionally separate from the HCDE build and
 release pipeline. It is built on the upstream MIT-licensed OpenHands.
@@ -27,9 +24,9 @@ release pipeline. It is built on the upstream MIT-licensed OpenHands.
 
 - `Services/BackendManager.cs` - locates and launches `agent-server.exe`, waits
   for the `/health` endpoint, and tears the process down on exit.
-- `Services/AgentSpecProvider.cs` - reuses the agent config the OpenHands CLI
-  saved in `~/.openhands/agent_settings.json` and forces non-native tool calling
-  (so local models do not leak tool-call syntax).
+- `Services/AgentSpecProvider.cs` - creates/reuses the agent config at
+  `~/.openhands/agent_settings.json` and sets tool-calling behavior for local
+  models.
 - `Services/AgentServerClient.cs` - creates a conversation over REST and streams
   events over the WebSocket, normalizing them into render-ready updates.
 - `MainWindow.xaml` / `.cs` - the chat UI: messages, thoughts, tool calls,
@@ -38,19 +35,18 @@ release pipeline. It is built on the upstream MIT-licensed OpenHands.
 ## Prerequisites
 
 1. **.NET 10 SDK** (to build) - the runtime is bundled when you publish.
-2. **OpenHands agent-server** - StayVibin installs this for you automatically the
-   first time you press **Start** (it installs `uv` if needed, then runs
-   `uv tool install openhands`). To do it manually instead:
+2. **StayVibin AI engine** - StayVibin installs this for you automatically the
+   first time you press **Start** (it installs `uv` if needed, then installs the
+   engine package). To do it manually instead:
    ```
    uv tool install openhands
    ```
    The app expects `agent-server.exe` at
    `%APPDATA%\uv\tools\openhands\Scripts\agent-server.exe` (override in Settings).
-3. **A configured model** - on first launch StayVibin shows a provider setup box
-   (Ollama for now) and writes `~/.openhands/agent_settings.json` for you. If a
-   config already exists (e.g. from the OpenHands CLI) it is reused as-is.
-4. **Ollama** running with at least one chat model pulled (e.g. `ollama pull
-   qwen2.5-coder:14b`). More local providers are planned.
+3. **Ollama** running with at least one chat model pulled (e.g.
+   `ollama pull qwen3:14b`). More local providers are planned.
+4. **A configured model** - on first launch StayVibin shows a provider setup box
+   (Ollama for now) and writes the engine settings for you.
 
 > Note: the agent-server, sdk, and tools packages must be version-compatible.
 > This repo was validated against `openhands-sdk==1.21.0` /
@@ -74,7 +70,7 @@ Produces a self-contained single-file executable at:
 bin\Release\net10.0-windows\win-x64\publish\StayVibin.exe
 ```
 
-## Build the Windows installer (v1.0+)
+## Build the Windows installer (v2.0+)
 
 ```
 powershell -ExecutionPolicy Bypass -File .\build-installer.ps1
@@ -88,7 +84,8 @@ dist\StayVibin-<version>-setup.exe
 ```
 
 The installer adds Start menu and Add/Remove Programs entries. Optional desktop shortcut.
-It does **not** bundle OpenHands or Ollama - install those separately (see Prerequisites).
+It does **not** bundle Ollama. Install Ollama separately (see Prerequisites);
+StayVibin sets up its own AI engine on first run.
 
 Download the latest release from
 [GitHub Releases](https://github.com/bokoxthexchocobo/StayVibin/releases).
@@ -101,7 +98,7 @@ Download the latest release from
 3. Type a task and press **Enter** (Shift+Enter for a newline). **Stop**
    interrupts a running agent.
 
-## Current scope (v1.0)
+## Current scope (v2.0)
 
 - Single conversation per session, with Start/Stop, Interrupt, and Steer.
 - Renders user/assistant messages, agent thoughts, tool calls, results, errors.
@@ -116,6 +113,17 @@ Download the latest release from
   `%APPDATA%\StayVibin`.
 - Live token streaming is rendered if the backend emits it; otherwise the final
   message is shown when the turn completes.
+
+## What's new in v2.0.0
+
+- Bundled StayVibin Engine support: the app launches its own modified local engine
+  by default instead of relying on a separately managed Ollama instance.
+- Improved tool-call reliability for local models through the new engine
+  integration, safer engine lifecycle management, and model-aware tuning.
+- Search/tooling fixes for agent investigations, including grep/glob behavior
+  that previously caused local models to miss obvious code paths.
+- Conversation persistence, model guidance, capability-aware defaults, and
+  broader reliability fixes across startup, model loading, and session control.
 
 ## What's new in v1.0.2
 

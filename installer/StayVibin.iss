@@ -1,4 +1,4 @@
-; StayVibin Windows installer (Inno Setup 6).
+﻿; StayVibin Windows installer (Inno Setup 6).
 ; Build with: powershell -File .\build-installer.ps1
 
 #define MyAppName "StayVibin"
@@ -55,6 +55,7 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
+Filename: "https://ollama.com/download"; Description: "Get Ollama (required local AI provider)"; Flags: shellexec nowait postinstall skipifsilent unchecked
 
 [Messages]
-WelcomeLabel2=This will install [name/ver] on your computer.%n%nStayVibin is a native Windows front-end for OpenHands. You still need Ollama and OpenHands (agent-server) installed separately - see the GitHub README for setup steps.
+WelcomeLabel2=This will install [name/ver] on your computer.%n%nStayVibin is a native Windows app for local AI vibe coding. Before using it you need a local AI provider installed - right now that is Ollama (https://ollama.com), with at least one chat model pulled. StayVibin sets up its own AI engine automatically on first run.

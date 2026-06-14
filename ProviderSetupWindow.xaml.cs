@@ -15,8 +15,8 @@ public partial class ProviderSetupWindow : Window
     /// <summary>Chosen provider label (e.g. "Ollama").</summary>
     public string Provider { get; private set; } = "Ollama";
 
-    /// <summary>Chosen provider base URL (e.g. http://localhost:11434).</summary>
-    public string OllamaUrl { get; private set; } = "http://localhost:11434";
+    /// <summary>Chosen provider base URL (defaults to the bundled StayVibin Engine).</summary>
+    public string OllamaUrl { get; private set; } = StayVibinEngineManager.DefaultBaseUrl;
 
     /// <summary>Chosen model tag (e.g. "qwen2.5-coder:14b").</summary>
     public string Model { get; private set; } = "";
@@ -29,7 +29,7 @@ public partial class ProviderSetupWindow : Window
         ProviderBox.SelectedIndex = 0;
 
         UrlBox.Text = string.IsNullOrWhiteSpace(settings.OllamaUrl)
-            ? "http://localhost:11434"
+            ? StayVibinEngineManager.DefaultBaseUrl
             : settings.OllamaUrl;
 
         Loaded += async (_, _) => await LoadModelsAsync();
@@ -101,7 +101,7 @@ public partial class ProviderSetupWindow : Window
         var url = UrlBox.Text.Trim();
         if (string.IsNullOrWhiteSpace(url))
         {
-            ShowError("Enter the Ollama URL (e.g. http://localhost:11434).");
+            ShowError($"Enter the engine URL (e.g. {StayVibinEngineManager.DefaultBaseUrl}).");
             return;
         }
 
