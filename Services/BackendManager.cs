@@ -101,7 +101,7 @@ public sealed class BackendManager : IDisposable
             throw new FileNotFoundException(
                 $"agent-server.exe not found at:\n{ExecutablePath}\n\n" +
                 "Press Start to let StayVibin install it automatically, or install " +
-                "the engine manually with: uv tool install openhands\n" +
+                "the engine manually with: uv tool install openhands --python 3.12\n" +
                 "Or set the path in Settings.", ExecutablePath);
 
         OpenLogFile();

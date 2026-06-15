@@ -6,7 +6,7 @@ namespace StayVibin.Services;
 /// <summary>
 /// One-click setup for the OpenHands agent-server so the user never has to open a
 /// terminal. It locates (or installs) Astral's `uv` tool manager, then runs
-/// `uv tool install openhands`, which places agent-server.exe under
+/// `uv tool install openhands --python 3.12`, which places agent-server.exe under
 /// %APPDATA%\uv\tools\openhands\. All command output is surfaced via
 /// <see cref="LogLine"/> so the UI can mirror it into the server-log pane.
 /// </summary>
@@ -32,7 +32,7 @@ public sealed class OpenHandsInstaller
 
     /// <summary>
     /// Ensure the OpenHands agent-server is installed. Installs uv first if needed.
-    /// Returns true only when `uv tool install openhands` completes successfully.
+    /// Returns true only when the uv tool install completes successfully.
     /// </summary>
     public async Task<bool> EnsureInstalledAsync(CancellationToken ct = default)
     {
@@ -54,8 +54,8 @@ public sealed class OpenHandsInstaller
         }
 
         Log($"Using uv at {uv}");
-        Log("Installing OpenHands (uv tool install openhands). This can take a few minutes...");
-        var ok = await RunStreamingAsync(uv, "tool install openhands", ct);
+        Log("Installing OpenHands (uv tool install openhands --python 3.12). This can take a few minutes...");
+        var ok = await RunStreamingAsync(uv, "tool install openhands --python 3.12", ct);
         Log(ok ? "OpenHands install completed." : "OpenHands install failed (see output above).");
         return ok;
     }

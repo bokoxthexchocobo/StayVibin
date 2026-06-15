@@ -834,7 +834,7 @@ public partial class MainWindow : Window
             {
                 AddError("Automatic setup of the AI engine failed - see the Server log "
                          + "for details. You can also install it manually by running: "
-                         + "uv tool install openhands");
+                         + "uv tool install openhands --python 3.12");
                 return false;
             }
 
