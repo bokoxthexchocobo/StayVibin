@@ -9,7 +9,7 @@ streaming local while giving you a real native desktop app.
 This project is standalone and intentionally separate from the HCDE build and
 release pipeline. It is built on the upstream MIT-licensed OpenHands.
 
-![StayVibin desktop app](docs/screenshots/app-v3.0.0-hotfix.1.png)
+![StayVibin desktop app](docs/screenshots/app.png)
 
 ## How it works
 
