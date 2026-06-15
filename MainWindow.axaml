@@ -1,0 +1,819 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:models="clr-namespace:StayVibin.Models;assembly=StayVibin"
+        xmlns:sv="clr-namespace:StayVibin;assembly=StayVibin"
+        xmlns:ae="clr-namespace:AvaloniaEdit;assembly=AvaloniaEdit"
+        x:Class="StayVibin.MainWindow"
+        Title="StayVibin" Height="760" Width="1200"
+        Icon="avares://StayVibin/Assets/stayvibin.png"
+        Background="{StaticResource Bg}"
+        WindowStartupLocation="CenterScreen"
+        FontFamily="Segoe UI, Inter, sans-serif" FontSize="13">
+
+    <Window.Resources>
+        <!-- Rotation transform animation template for spinner in code -->
+    </Window.Resources>
+
+    <Grid x:Name="RootGrid">
+        <Grid.ColumnDefinitions>
+            <!-- Sidebar Tab Navigation (Sleek Cyber-Neon Left Bar) -->
+            <ColumnDefinition Width="68"/>
+            <!-- Main Content Area -->
+            <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+
+        <!-- Sidebar Left Bar -->
+        <Border Grid.Column="0" Background="{StaticResource Panel}" BorderBrush="{StaticResource Border}" BorderThickness="0,0,1,0">
+            <Grid RowDefinitions="Auto,*,Auto">
+                <!-- App Brand Image -->
+                <StackPanel Grid.Row="0" Margin="0,20,0,0" HorizontalAlignment="Center">
+                    <Image Source="avares://StayVibin/Assets/stayvibin.png" Width="36" Height="36" ToolTip.Tip="StayVibin Workspace"/>
+                </StackPanel>
+
+                <!-- Sidebar Tab Buttons -->
+                <StackPanel Grid.Row="1" Spacing="20" Margin="0,40,0,0" HorizontalAlignment="Center">
+                    <!-- Chat View Tab -->
+                    <Button Name="TabChatBtn" Classes="icon active" Click="OnSidebarTabClick" Tag="0" ToolTip.Tip="Chat Workspace">
+                        <TextBlock Text="🤖" FontSize="18" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    </Button>
+                    <!-- Model Store Tab -->
+                    <Button Name="TabStoreBtn" Classes="icon" Click="OnSidebarTabClick" Tag="1" ToolTip.Tip="Model Store">
+                        <TextBlock Text="🏪" FontSize="18" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    </Button>
+                    <!-- Settings Tab -->
+                    <Button Name="TabSettingsBtn" Classes="icon" Click="OnSidebarTabClick" Tag="2" ToolTip.Tip="Settings">
+                        <TextBlock Text="⚙️" FontSize="18" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    </Button>
+                </StackPanel>
+
+                <!-- Utility buttons pinned to the bottom of the nav rail: git status and
+                     the server-log toggle (moved out of the chat input bar / session strip). -->
+                <StackPanel Grid.Row="1" VerticalAlignment="Bottom" Spacing="16" Margin="0,0,0,16" HorizontalAlignment="Center">
+                    <Button Name="RepoButton" Classes="icon" FontSize="16" Click="OnRepoRefresh" IsVisible="False" ToolTip.Tip="Git status"/>
+                    <Button Name="LogButton" Classes="icon" Click="OnToggleLog" ToolTip.Tip="Toggle engine and server execution log">
+                        <TextBlock Text="📜" FontSize="15" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    </Button>
+                </StackPanel>
+
+                <!-- Version Indicator at Bottom -->
+                <TextBlock Grid.Row="2" Text="v2.1" Foreground="{StaticResource TextDim}" FontSize="11" HorizontalAlignment="Center" Margin="0,0,0,20"/>
+            </Grid>
+        </Border>
+
+        <!-- Main Viewport (TabControl with Hidden Headers) -->
+        <TabControl Grid.Column="1" Name="MainTabControl" SelectedIndex="0" Padding="0" Margin="0" Theme="{DynamicResource {x:Type TabControl}}">
+            <TabControl.Styles>
+                <Style Selector="TabControl /template/ ItemsPresenter#PART_ItemsPresenter">
+                    <Setter Property="IsVisible" Value="False" />
+                </Style>
+            </TabControl.Styles>
+
+            <!-- =================== TAB 0: CHAT WORKSPACE =================== -->
+            <TabItem Header="Chat">
+                <Grid RowDefinitions="Auto,*,Auto,Auto">
+                    <!-- Top Bar: Model Selector, Start/Stop Button, and Inline view toggles -->
+                    <Border Grid.Row="0" Background="{StaticResource Panel}" BorderBrush="{StaticResource Border}" BorderThickness="0,0,0,1" Padding="16,12">
+                        <Grid ColumnDefinitions="Auto,*,Auto">
+                            <!-- Model Combo and Brand Left -->
+                            <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
+                                <TextBlock Text="Stay" Foreground="{StaticResource Text}" FontSize="18" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                                <TextBlock Text="Vibin" Foreground="{StaticResource Accent}" FontSize="18" FontWeight="SemiBold" Margin="2,0,0,0" VerticalAlignment="Center"/>
+                                <TextBlock Text="Model" Foreground="{StaticResource TextDim}" FontSize="12" VerticalAlignment="Center" Margin="16,0,8,0"/>
+                                <ComboBox Name="ModelCombo" Classes="darkCombo" MinWidth="200" VerticalAlignment="Center" SelectionChanged="OnModelSelected" ToolTip.Tip="Ollama models detected locally">
+                                    <ComboBox.ItemTemplate>
+                                        <DataTemplate DataType="{x:Type models:ModelEntry}">
+                                            <TextBlock Text="{Binding Name}"/>
+                                        </DataTemplate>
+                                    </ComboBox.ItemTemplate>
+                                </ComboBox>
+                                <Button Name="RefreshModelsButton" Content="↻" Classes="flat" Padding="8,2" FontSize="14" Margin="6,0,0,0" VerticalAlignment="Center" Click="OnRefreshModels" ToolTip.Tip="Re-scan installed models"/>
+                                <WrapPanel Name="CapabilityPanel" VerticalAlignment="Center" Margin="14,0"/>
+                            </StackPanel>
+
+                            <!-- Flexible Middle Space (Clean) -->
+                            <Grid Grid.Column="1"/>
+
+                            <!-- Right Controls: View toggles, start button -->
+                            <StackPanel Grid.Column="2" Orientation="Horizontal">
+                                <Button Name="HistoryToggle" Content="Chats" Classes="flat" Click="OnToggleHistory" Margin="0,0,8,0" ToolTip.Tip="Toggle chat history panel"/>
+                                <Button Name="ExplorerToggle" Content="Files" Classes="flat" Click="OnToggleExplorer" Margin="0,0,8,0" ToolTip.Tip="Toggle project explorer panel"/>
+                                <Button Name="WorkDirButton" Content="Folder" Classes="flat" Click="OnPickWorkDir" Margin="0,0,8,0" ToolTip.Tip="Select the agent's working folder"/>
+                                <Button Name="StartButton" Classes="accent" Click="OnStartClick" MinWidth="140">
+                                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                        <!-- Rotation Spinner -->
+                                        <Grid Name="ButtonSpinner" Width="14" Height="14" Margin="0,0,8,0" IsVisible="False" VerticalAlignment="Center">
+                                            <Ellipse Width="14" Height="14" Stroke="#59FFFFFF" StrokeThickness="2"/>
+                                            <Ellipse Width="14" Height="14" Stroke="White" StrokeThickness="2" StrokeDashArray="3,6"/>
+                                        </Grid>
+                                        <TextBlock Name="StartButtonText" Text="Start" VerticalAlignment="Center" FontWeight="SemiBold"/>
+                                        <Border Name="StatusSeparator" Width="1" Height="12" Background="#40FFFFFF" Margin="8,0"/>
+                                        <TextBlock Name="StatusText" Text="Stopped" Foreground="#E0FFFFFF" VerticalAlignment="Center" FontSize="12"/>
+                                    </StackPanel>
+                                </Button>
+                            </StackPanel>
+                        </Grid>
+                    </Border>
+
+                    <!-- Workspace Panel with nested History, Explorer, and Chat/Editor columns -->
+                    <Grid Grid.Row="1" ColumnDefinitions="Auto,Auto,Auto,Auto,*">
+                        <!-- 1. Conversation History (Leftmost Column) -->
+                        <Border Grid.Column="0" Name="HistoryPanel" Width="220" Background="{StaticResource Panel}" BorderBrush="{StaticResource Border}" BorderThickness="0,0,1,0" IsVisible="True">
+                            <Grid RowDefinitions="Auto,*">
+                                <Grid Grid.Row="0" Margin="12,10,12,8" ColumnDefinitions="*,Auto">
+                                    <TextBlock Grid.Column="0" Text="Chats" Foreground="{StaticResource TextDim}" FontSize="12" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                                    <Button Grid.Column="1" Name="NewChatButton" Content="+ New" Classes="flat" Padding="8,2" FontSize="11" Click="OnNewChat" IsEnabled="False" ToolTip.Tip="Start a new chat session"/>
+                                </Grid>
+                                <ListBox Grid.Row="1" Name="ConversationList" Background="Transparent" BorderThickness="0" SelectionChanged="OnConversationSelected">
+                                    <ListBox.ItemTemplate>
+                                        <DataTemplate DataType="{x:Type models:ConversationRow}">
+                                            <Grid ColumnDefinitions="*,Auto" Margin="2">
+                                                <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                                                    <TextBlock Text="{Binding DisplayTitle}" Foreground="{StaticResource Text}" FontSize="12.5" TextTrimming="CharacterEllipsis"/>
+                                                    <TextBlock Text="{Binding Subtitle}" Foreground="{StaticResource TextDim}" FontSize="10.5" TextTrimming="CharacterEllipsis" Margin="0,1,0,0"/>
+                                                </StackPanel>
+                                                <Button Grid.Column="1" Content="✕" Tag="{Binding Id}" Classes="flat" Padding="4,2" FontSize="10" VerticalAlignment="Center" Margin="6,0,0,0" Click="OnDeleteConversation" ToolTip.Tip="Delete chat"/>
+                                            </Grid>
+                                        </DataTemplate>
+                                    </ListBox.ItemTemplate>
+                                </ListBox>
+                            </Grid>
+                        </Border>
+
+                        <!-- Horizontal Splitter 1 -->
+                        <GridSplitter Grid.Column="1" Name="HistorySplitter" Width="6" Background="{StaticResource Border}" HorizontalAlignment="Center" VerticalAlignment="Stretch" Cursor="SizeWestEast"/>
+
+                        <!-- 2. File Explorer (Middle Column) -->
+                        <Border Grid.Column="2" Name="ExplorerPanel" Width="250" Background="{StaticResource Panel}" BorderBrush="{StaticResource Border}" BorderThickness="0,0,1,0" IsVisible="True">
+                            <Grid RowDefinitions="Auto,*">
+                                <Grid Grid.Row="0" Margin="12,10,12,8" ColumnDefinitions="*,Auto">
+                                    <TextBlock Grid.Column="0" Text="Project Files" Foreground="{StaticResource TextDim}" FontSize="12" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                                    <Button Grid.Column="1" Content="Refresh" Classes="flat" Padding="8,2" FontSize="11" Click="OnRefreshTree" ToolTip.Tip="Re-scan directory"/>
+                                </Grid>
+                                <TreeView Grid.Row="1" Name="FileTree" Background="Transparent" BorderThickness="0" DoubleTapped="OnTreeDoubleClick">
+                                    <!-- Templates for Hierarchical TreeNodes -->
+                                    <TreeView.ItemTemplate>
+                                        <TreeDataTemplate DataType="{x:Type models:FileNode}" ItemsSource="{Binding Children}">
+                                            <StackPanel Orientation="Horizontal" Margin="0,2">
+                                                <TextBlock Text="{Binding Icon}" FontSize="12" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                                                <TextBlock Name="FileName" Text="{Binding Name}" FontSize="12.5" VerticalAlignment="Center" Foreground="{StaticResource Text}"/>
+                                                <TextBlock Text="{Binding StatusText}" FontSize="10" FontWeight="Bold" VerticalAlignment="Center" Margin="6,0,0,0" Foreground="{StaticResource Warn}"/>
+                                            </StackPanel>
+                                        </TreeDataTemplate>
+                                    </TreeView.ItemTemplate>
+                                </TreeView>
+                            </Grid>
+                        </Border>
+
+                        <!-- Horizontal Splitter 2 -->
+                        <GridSplitter Grid.Column="3" Name="ExplorerSplitter" Width="6" Background="{StaticResource Border}" HorizontalAlignment="Center" VerticalAlignment="Stretch" Cursor="SizeWestEast"/>
+
+                        <!-- 3. Chat Messages / Code Editor Column (Rightmost Main Workspace) -->
+                        <Grid Grid.Column="4" ColumnDefinitions="*,Auto,Auto">
+                            <!-- Left: Conversation Stream -->
+                            <ScrollViewer Grid.Column="0" Name="ChatScroll" VerticalScrollBarVisibility="Auto" Padding="20,16,20,0" Background="{StaticResource Bg}" ScrollChanged="OnChatScrollChanged">
+                                <StackPanel>
+                                    <ItemsControl Name="ChatList">
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate DataType="{x:Type models:ChatItem}">
+                                            <!-- Responsive Flex Box for Avatars and Bubbles -->
+                                            <Grid Margin="0,6"
+                                                  Classes.user="{Binding IsUser}"
+                                                  Classes.thought="{Binding IsThought}"
+                                                  Classes.thinking="{Binding IsThinking}"
+                                                  Classes.tool="{Binding IsTool}"
+                                                  Classes.observation="{Binding IsObservation}"
+                                                  Classes.error="{Binding IsError}"
+                                                  Classes.system="{Binding IsSystem}">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+
+                                                <!-- Left Avatar Panel -->
+                                                <Border Name="LeftAvatar" Grid.Column="0" Width="30" Height="30" CornerRadius="15" 
+                                                        Background="{StaticResource Panel}" BorderBrush="{StaticResource Border}" BorderThickness="1"
+                                                        VerticalAlignment="Top" Margin="0,2,10,0">
+                                                    <Border.Styles>
+                                                        <Style Selector="Grid.user Border#LeftAvatar">
+                                                            <Setter Property="IsVisible" Value="False"/>
+                                                        </Style>
+                                                        <Style Selector="Grid.system Border#LeftAvatar">
+                                                            <Setter Property="IsVisible" Value="False"/>
+                                                        </Style>
+                                                        <!-- Reasoning renders as plain text (Cursor-style), no avatar. -->
+                                                        <Style Selector="Grid.thought Border#LeftAvatar">
+                                                            <Setter Property="IsVisible" Value="False"/>
+                                                        </Style>
+                                                        <Style Selector="Grid.tool Border#LeftAvatar">
+                                                            <Setter Property="BorderBrush" Value="{StaticResource Ok}"/>
+                                                        </Style>
+                                                        <Style Selector="Grid.error Border#LeftAvatar">
+                                                            <Setter Property="BorderBrush" Value="{StaticResource Err}"/>
+                                                            <Setter Property="Background" Value="{StaticResource ErrBubble}"/>
+                                                        </Style>
+                                                    </Border.Styles>
+                                                    <TextBlock Name="LeftAvatarText" Text="🤖" FontSize="15" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                                        <TextBlock.Styles>
+                                                            <Style Selector="Grid.thought TextBlock#LeftAvatarText">
+                                                                <Setter Property="Text" Value="🧠"/>
+                                                            </Style>
+                                                            <Style Selector="Grid.tool TextBlock#LeftAvatarText">
+                                                                <Setter Property="Text" Value="🛠️"/>
+                                                            </Style>
+                                                            <Style Selector="Grid.observation TextBlock#LeftAvatarText">
+                                                                <Setter Property="Text" Value="👁️"/>
+                                                            </Style>
+                                                            <Style Selector="Grid.error TextBlock#LeftAvatarText">
+                                                                <Setter Property="Text" Value="❌"/>
+                                                            </Style>
+                                                        </TextBlock.Styles>
+                                                    </TextBlock>
+                                                </Border>
+
+                                                <!-- Chat Bubble Panel -->
+                                                <Border Name="Bubble" Grid.Column="1" CornerRadius="10" Padding="14,10" MaxWidth="820" HorizontalAlignment="Left" Background="{StaticResource AgentBubble}" BorderBrush="{StaticResource Border}" BorderThickness="1">
+                                                    <Border.Styles>
+                                                        <Style Selector="Grid.user Border#Bubble">
+                                                            <Setter Property="Background" Value="{StaticResource UserBubble}"/>
+                                                            <Setter Property="HorizontalAlignment" Value="Right"/>
+                                                        </Style>
+                                                        <!-- Reasoning is plain text, not a bubble: transparent, no
+                                                             border, no padding, full width. -->
+                                                        <Style Selector="Grid.thought Border#Bubble">
+                                                            <Setter Property="Background" Value="Transparent"/>
+                                                            <Setter Property="BorderThickness" Value="0"/>
+                                                            <Setter Property="Padding" Value="0"/>
+                                                            <Setter Property="MaxWidth" Value="Infinity"/>
+                                                            <Setter Property="HorizontalAlignment" Value="Stretch"/>
+                                                        </Style>
+                                                        <Style Selector="Grid.tool Border#Bubble">
+                                                            <Setter Property="Background" Value="{StaticResource ToolBubble}"/>
+                                                        </Style>
+                                                        <Style Selector="Grid.observation Border#Bubble">
+                                                            <Setter Property="Background" Value="{StaticResource Panel}"/>
+                                                        </Style>
+                                                        <Style Selector="Grid.error Border#Bubble">
+                                                            <Setter Property="Background" Value="{StaticResource ErrBubble}"/>
+                                                        </Style>
+                                                        <Style Selector="Grid.system Border#Bubble">
+                                                            <Setter Property="Background" Value="{StaticResource Bg}"/>
+                                                            <Setter Property="BorderThickness" Value="0"/>
+                                                            <Setter Property="HorizontalAlignment" Value="Center"/>
+                                                        </Style>
+                                                    </Border.Styles>
+                                                    <Grid>
+                                                        <!-- Normal Panel: Header + Body -->
+                                                        <StackPanel Name="NormalPanel">
+                                                            <StackPanel.Styles>
+                                                                <Style Selector="Grid.thought StackPanel#NormalPanel">
+                                                                    <Setter Property="IsVisible" Value="False"/>
+                                                                </Style>
+                                                            </StackPanel.Styles>
+                                                            <TextBlock Name="Hdr" Text="{Binding Header}" Foreground="{StaticResource TextDim}" FontSize="11" FontWeight="SemiBold" Margin="0,0,0,4">
+                                                                <TextBlock.Styles>
+                                                                    <Style Selector="Grid.tool TextBlock#Hdr">
+                                                                        <Setter Property="Foreground" Value="{StaticResource Ok}"/>
+                                                                    </Style>
+                                                                    <Style Selector="Grid.error TextBlock#Hdr">
+                                                                        <Setter Property="Foreground" Value="{StaticResource Err}"/>
+                                                                    </Style>
+                                                                    <Style Selector="Grid.system TextBlock#Hdr">
+                                                                        <Setter Property="IsVisible" Value="False"/>
+                                                                    </Style>
+                                                                </TextBlock.Styles>
+                                                            </TextBlock>
+                                                            <TextBox Text="{Binding Text, Mode=OneWay}" IsReadOnly="True" Name="Body" Background="Transparent" BorderThickness="0" Foreground="{StaticResource Text}" TextWrapping="Wrap" Padding="0" IsTabStop="False" Cursor="IBeam">
+                                                                <TextBox.Styles>
+                                                                    <Style Selector="Grid.tool TextBox#Body">
+                                                                        <Setter Property="FontFamily" Value="Consolas, monospace"/>
+                                                                    </Style>
+                                                                    <Style Selector="Grid.observation TextBox#Body">
+                                                                        <Setter Property="FontFamily" Value="Consolas, monospace"/>
+                                                                        <Setter Property="Foreground" Value="{StaticResource TextDim}"/>
+                                                                    </Style>
+                                                                    <Style Selector="Grid.system TextBox#Body">
+                                                                        <Setter Property="Foreground" Value="{StaticResource TextDim}"/>
+                                                                    </Style>
+                                                                </TextBox.Styles>
+                                                            </TextBox>
+                                                        </StackPanel>
+
+                                                        <!-- Reasoning / Thought: plain dimmed text (Cursor-style) with
+                                                             an animated "Assistant is thinking..." header while live. -->
+                                                        <StackPanel Name="ThoughtPanel" IsVisible="False">
+                                                            <StackPanel.Styles>
+                                                                <Style Selector="Grid.thought StackPanel#ThoughtPanel">
+                                                                    <Setter Property="IsVisible" Value="True"/>
+                                                                </Style>
+                                                            </StackPanel.Styles>
+                                                            <!-- Header row: static "Thought" or live "Assistant is thinking" + dots. -->
+                                                            <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,0,3">
+                                                                <TextBlock Name="ThoughtLabel" Text="Thought" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource TextDim}">
+                                                                    <TextBlock.Styles>
+                                                                        <Style Selector="Grid.thinking TextBlock#ThoughtLabel">
+                                                                            <Setter Property="Text" Value="Assistant is thinking"/>
+                                                                        </Style>
+                                                                    </TextBlock.Styles>
+                                                                </TextBlock>
+                                                                <!-- Animated bouncing dots, shown only while actively thinking. -->
+                                                                <StackPanel Name="ThinkingDots" Orientation="Horizontal" Spacing="3" Margin="6,0,0,0" VerticalAlignment="Bottom" IsVisible="False">
+                                                                    <StackPanel.Styles>
+                                                                        <Style Selector="Grid.thinking StackPanel#ThinkingDots">
+                                                                            <Setter Property="IsVisible" Value="True"/>
+                                                                        </Style>
+                                                                        <Style Selector="Ellipse.tdot">
+                                                                            <Setter Property="Width" Value="4"/>
+                                                                            <Setter Property="Height" Value="4"/>
+                                                                            <Setter Property="Fill" Value="{StaticResource TextDim}"/>
+                                                                            <Setter Property="VerticalAlignment" Value="Bottom"/>
+                                                                            <Setter Property="RenderTransform" Value="translateY(0px)"/>
+                                                                        </Style>
+                                                                        <Style Selector="Ellipse.tdot1">
+                                                                            <Style.Animations>
+                                                                                <Animation Duration="0:0:0.9" IterationCount="INFINITE" Delay="0:0:0">
+                                                                                    <KeyFrame Cue="0%"><Setter Property="TranslateTransform.Y" Value="0"/></KeyFrame>
+                                                                                    <KeyFrame Cue="30%"><Setter Property="TranslateTransform.Y" Value="-4"/></KeyFrame>
+                                                                                    <KeyFrame Cue="60%"><Setter Property="TranslateTransform.Y" Value="0"/></KeyFrame>
+                                                                                    <KeyFrame Cue="100%"><Setter Property="TranslateTransform.Y" Value="0"/></KeyFrame>
+                                                                                </Animation>
+                                                                            </Style.Animations>
+                                                                        </Style>
+                                                                        <Style Selector="Ellipse.tdot2">
+                                                                            <Style.Animations>
+                                                                                <Animation Duration="0:0:0.9" IterationCount="INFINITE" Delay="0:0:0.15">
+                                                                                    <KeyFrame Cue="0%"><Setter Property="TranslateTransform.Y" Value="0"/></KeyFrame>
+                                                                                    <KeyFrame Cue="30%"><Setter Property="TranslateTransform.Y" Value="-4"/></KeyFrame>
+                                                                                    <KeyFrame Cue="60%"><Setter Property="TranslateTransform.Y" Value="0"/></KeyFrame>
+                                                                                    <KeyFrame Cue="100%"><Setter Property="TranslateTransform.Y" Value="0"/></KeyFrame>
+                                                                                </Animation>
+                                                                            </Style.Animations>
+                                                                        </Style>
+                                                                        <Style Selector="Ellipse.tdot3">
+                                                                            <Style.Animations>
+                                                                                <Animation Duration="0:0:0.9" IterationCount="INFINITE" Delay="0:0:0.3">
+                                                                                    <KeyFrame Cue="0%"><Setter Property="TranslateTransform.Y" Value="0"/></KeyFrame>
+                                                                                    <KeyFrame Cue="30%"><Setter Property="TranslateTransform.Y" Value="-4"/></KeyFrame>
+                                                                                    <KeyFrame Cue="60%"><Setter Property="TranslateTransform.Y" Value="0"/></KeyFrame>
+                                                                                    <KeyFrame Cue="100%"><Setter Property="TranslateTransform.Y" Value="0"/></KeyFrame>
+                                                                                </Animation>
+                                                                            </Style.Animations>
+                                                                        </Style>
+                                                                    </StackPanel.Styles>
+                                                                    <Ellipse Classes="tdot tdot1"/>
+                                                                    <Ellipse Classes="tdot tdot2"/>
+                                                                    <Ellipse Classes="tdot tdot3"/>
+                                                                </StackPanel>
+                                                            </StackPanel>
+                                                            <TextBox Text="{Binding Text, Mode=OneWay}" IsReadOnly="True" Name="ThoughtBody" Background="Transparent" BorderThickness="0" Foreground="{StaticResource TextDim}" FontStyle="Italic" TextWrapping="Wrap" Padding="0" IsTabStop="False" Cursor="IBeam"/>
+                                                        </StackPanel>
+                                                    </Grid>
+                                                </Border>
+
+                                                <!-- Right Avatar Panel (User only) -->
+                                                <Border Name="RightAvatar" Grid.Column="2" Width="30" Height="30" CornerRadius="15" Background="{StaticResource Accent}" BorderBrush="{StaticResource Border}" BorderThickness="1" VerticalAlignment="Top" Margin="10,2,0,0" IsVisible="False">
+                                                    <Border.Styles>
+                                                        <Style Selector="Grid.user Border#RightAvatar">
+                                                            <Setter Property="IsVisible" Value="True"/>
+                                                        </Style>
+                                                    </Border.Styles>
+                                                    <TextBlock Text="👤" FontSize="14" Foreground="White" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                                </Border>
+                                            </Grid>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                    <!-- Real scrollable tail space so the newest bubble clears the docked
+                                         input/status/log panels instead of landing flush against the viewport. -->
+                                    <Border Name="ChatTailSpacer" Height="112"/>
+                                </StackPanel>
+                            </ScrollViewer>
+
+                            <!-- Floating "jump to latest" button. Appears in the chat column
+                                 (same cell as the scroll viewer) only when the user has
+                                 scrolled up away from the newest message. -->
+                            <Button Grid.Column="0" Name="ScrollDownButton" Classes="icon" Width="34" Height="34"
+                                    HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="0,0,22,16"
+                                    IsVisible="False" Click="OnScrollDownClick" ToolTip.Tip="Jump to latest message">
+                                <TextBlock Text="&#x2193;" FontSize="18" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                            </Button>
+
+                            <!-- Vertical Splitter for Code Editor -->
+                            <GridSplitter Grid.Column="1" Name="EditorSplitter" Width="6" Background="{StaticResource Border}" HorizontalAlignment="Center" VerticalAlignment="Stretch" IsVisible="False" Cursor="SizeWestEast"/>
+
+                            <!-- Right: Collapsible Code Workspace Editor -->
+                            <Border Grid.Column="2" Name="EditorPanel" Width="480" Background="{StaticResource Panel}" BorderBrush="{StaticResource Border}" BorderThickness="1,0,0,0" IsVisible="False">
+                                <Grid RowDefinitions="Auto,*">
+                                    <!-- Save, Close, and Editor headers -->
+                                    <Grid Grid.Row="0" Background="{StaticResource PanelAlt}" ColumnDefinitions="*,Auto,Auto" Height="38">
+                                        <TextBlock Name="EditorFileName" Text="file.txt" Foreground="{StaticResource TextDim}" FontSize="12.5" VerticalAlignment="Center" Margin="12,6" TextTrimming="CharacterEllipsis"/>
+                                        <Button Name="EditorSaveButton" Grid.Column="1" Content="Save" Classes="flat" Padding="10,3" FontSize="11.5" Margin="0,4,6,4" Click="OnEditorSave" IsEnabled="False" ToolTip.Tip="Save file changes (Ctrl+S)"/>
+                                        <Button Grid.Column="2" Content="✕" Classes="flat" Padding="8,3" FontSize="11.5" Margin="0,4,8,4" Click="OnEditorClose" ToolTip.Tip="Close editor panel"/>
+                                    </Grid>
+                                    <!-- The Code Editor Control -->
+                                    <ae:TextEditor Grid.Row="1" Name="CodeEditor" ShowLineNumbers="True" FontFamily="Consolas, monospace" FontSize="13" Background="{StaticResource Bg}" Foreground="{StaticResource Text}" LineNumbersForeground="{StaticResource TextDim}" WordWrap="False" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto"/>
+                                </Grid>
+                            </Border>
+                        </Grid>
+                    </Grid>
+
+                    <!-- Session strip: Configuration parameters and Auto-compact status telemetry -->
+                    <Border Grid.Row="2" Background="{StaticResource Bg}" BorderBrush="{StaticResource Border}" BorderThickness="0,1,0,1" Padding="16,8">
+                        <Grid ColumnDefinitions="Auto,Auto,*,Auto">
+                            <!-- Toggle configuration settings -->
+                            <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,18,0">
+                                <TextBlock Text="Plan" Classes="fieldLabel" Margin="0,0,8,0"/>
+                                <ComboBox Name="PlanModeCombo" Classes="darkCombo" MinWidth="84" SelectionChanged="OnPlanModeChanged" ToolTip.Tip="Plan Mode: have the agent propose changes first for approval.">
+                                    <ComboBoxItem Content="Off"/>
+                                    <ComboBoxItem Content="Ask"/>
+                                    <ComboBoxItem Content="Auto"/>
+                                    <ComboBoxItem Content="Always"/>
+                                </ComboBox>
+                                <TextBlock Text="Perm" Classes="fieldLabel" Margin="14,0,8,0"/>
+                                <ComboBox Name="PermissionModeCombo" Classes="darkCombo" MinWidth="94" SelectionChanged="OnPermissionModeChanged" ToolTip.Tip="Permission confirmation level">
+                                    <ComboBoxItem Content="Ask"/>
+                                    <ComboBoxItem Content="Allow all"/>
+                                </ComboBox>
+                            </StackPanel>
+
+                            <!-- Context usage meter: a Cursor-style ring that fills as the
+                                 context window is consumed. Click it to compact (summarize)
+                                 the conversation now; the numeric usage stays to the side. -->
+                            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                                <TextBlock Text="Context" Classes="fieldLabel" Margin="0,0,10,0"/>
+                                <Button Name="ContextButton" Classes="ring" Click="OnCompactClick" IsEnabled="False"
+                                        ToolTip.Tip="Context usage - click to compact (summarize) the conversation now">
+                                    <Grid Width="22" Height="22">
+                                        <Ellipse Width="22" Height="22" Stroke="{StaticResource Border}" StrokeThickness="3"/>
+                                        <Arc Name="ContextArc" Width="22" Height="22" Stroke="{StaticResource Accent}" StrokeThickness="3" StartAngle="-90" SweepAngle="0"/>
+                                    </Grid>
+                                </Button>
+                                <TextBlock Name="ContextText" Text="-- / --" Foreground="{StaticResource TextDim}" FontSize="12" VerticalAlignment="Center" Margin="10,0,0,0"/>
+                            </StackPanel>
+
+                            <!-- Telemetry stats (git status + log + compact moved elsewhere). -->
+                            <StackPanel Grid.Column="3" Orientation="Horizontal" VerticalAlignment="Center">
+                                <!-- Prompt-processing (prefill) progress. Visible only while the
+                                     engine reads a long prompt before it starts replying. -->
+                                <StackPanel Name="PrefillPanel" Orientation="Horizontal" VerticalAlignment="Center" IsVisible="False" Margin="0,0,14,0" ToolTip.Tip="Reading the prompt into the model before it replies (prefill)">
+                                    <TextBlock Text="Reading prompt" Foreground="{StaticResource TextDim}" FontSize="12" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                    <ProgressBar Name="PrefillBar" Minimum="0" Maximum="100" Value="0" Width="90" Height="6" VerticalAlignment="Center"/>
+                                    <TextBlock Name="PrefillText" Text="0%" Foreground="{StaticResource Accent}" FontSize="12" VerticalAlignment="Center" Margin="8,0,0,0"/>
+                                </StackPanel>
+                                <TextBlock Name="TokensText" Text="Tokens: 0" Foreground="{StaticResource TextDim}" FontSize="12"/>
+                                <!-- Live generation readout: tokens produced this turn and the
+                                     current decode speed, parsed straight from the engine log. -->
+                                <TextBlock Name="GenText" Text="" IsVisible="False" Foreground="{StaticResource Accent}" FontSize="12" Margin="14,0,0,0"
+                                           ToolTip.Tip="Tokens generated this turn and current decode speed"/>
+                                <TextBlock Name="CostText" Text="" Foreground="{StaticResource TextDim}" FontSize="12" Margin="14,0,0,0"/>
+                            </StackPanel>
+                        </Grid>
+                    </Border>
+
+                    <!-- Bottom dock panel: Suggested actions, pending approvals, prompt input controls, and log window -->
+                    <Grid Grid.Row="3" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto">
+                        <!-- A. Recommended Model Installation Alert banner -->
+                        <Border Grid.Row="0" Name="ModelSuggestionBar" IsVisible="False" Background="{StaticResource PanelAlt}" BorderBrush="{StaticResource Accent}" BorderThickness="0,2,0,0" Padding="16,10">
+                            <Grid ColumnDefinitions="*,Auto">
+                                <StackPanel Grid.Column="0" VerticalAlignment="Center" Margin="0,0,12,0">
+                                    <TextBlock Text="Install a better-suited model" Foreground="{StaticResource Text}" FontWeight="SemiBold" FontSize="13"/>
+                                    <TextBlock Text="One-click installs it instantly via the Model Store - no commands needed." Foreground="{StaticResource TextDim}" FontSize="11" Margin="0,2,0,0"/>
+                                </StackPanel>
+                                <StackPanel Name="ModelSuggestionButtons" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center"/>
+                            </Grid>
+                        </Border>
+
+                        <!-- B. Risky Action Confirmation Approval Banner -->
+                        <Border Grid.Row="1" Name="PermissionApprovalBar" IsVisible="False" Background="{StaticResource PanelAlt}" BorderBrush="{StaticResource Warn}" BorderThickness="0,2,0,0" Padding="16,10">
+                            <Grid ColumnDefinitions="*,Auto">
+                                <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                                    <TextBlock Text="Permission needed" Foreground="{StaticResource Text}" FontWeight="SemiBold" FontSize="13"/>
+                                    <TextBlock Name="PermissionText" Text="The agent wants to perform an action that needs your approval." Foreground="{StaticResource TextDim}" FontSize="11" Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                                    <Button Name="PermissionDenyButton" Content="Deny" Classes="flat" Click="OnPermissionDeny" Margin="0,0,8,0" ToolTip.Tip="Decline action execution"/>
+                                    <Button Name="PermissionAllowButton" Content="Allow once" Classes="accent" Click="OnPermissionAllow" Margin="0,0,8,0" ToolTip.Tip="Allow this single execution"/>
+                                    <Button Name="PermissionAllowAllButton" Content="Allow all" Classes="flat" Click="OnPermissionAllowAll" ToolTip.Tip="Allow everything in this run"/>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+
+                        <!-- C. Design Proposes Planning Approval Banner -->
+                        <Border Grid.Row="2" Name="PlanApprovalBar" IsVisible="False" Background="{StaticResource PanelAlt}" BorderBrush="{StaticResource Accent}" BorderThickness="0,2,0,0" Padding="16,10">
+                            <Grid ColumnDefinitions="*,Auto">
+                                <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                                    <TextBlock Text="Design plan proposed" Foreground="{StaticResource Text}" FontWeight="SemiBold" FontSize="13"/>
+                                    <TextBlock Name="PlanProposedText" Text="The agent has produced an implementation plan. Review it below." Foreground="{StaticResource TextDim}" FontSize="11" Margin="0,2,0,0" TextWrapping="Wrap"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                                    <Button Name="PlanDenyButton" Content="Reject" Classes="flat" Click="OnPlanDeny" Margin="0,0,8,0" ToolTip.Tip="Reject plan and stop turn"/>
+                                    <Button Name="PlanAllowButton" Content="Approve" Classes="accent" Click="OnPlanApprove" ToolTip.Tip="Approve implementation plan"/>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+
+                        <!-- Staged Attachments Chips Panel -->
+                        <WrapPanel Grid.Row="3" Name="AttachPanel" IsVisible="False" Margin="16,6" VerticalAlignment="Center"/>
+
+                        <!-- D. User Message Input Controls -->
+                        <Border Grid.Row="4" Background="{StaticResource Panel}" Padding="16,10" BorderBrush="{StaticResource Border}" BorderThickness="0,1,0,0">
+                            <Grid ColumnDefinitions="Auto,*,Auto,Auto,Auto">
+                                <Button Name="AttachButton" Grid.Column="0" Content="+" Classes="icon" Click="OnAttachClick" Margin="0,0,10,0" IsEnabled="False" ToolTip.Tip="Attach file context (drag &amp; drop also supported)"/>
+                                <TextBox Name="InputBox" Grid.Column="1" Classes="darkInput" Height="36" Watermark="Type message — Enter to send" VerticalContentAlignment="Center" KeyDown="OnInputKeyDown" IsEnabled="False"/>
+                                <Button Name="SteerButton" Grid.Column="2" Content="Steer" Classes="flat" Click="OnSteerClick" Margin="10,0,0,0" Height="36" MinWidth="70" IsEnabled="False" ToolTip.Tip="Provide feedback to the active planner"/>
+                                <Button Name="SendButton" Grid.Column="3" Content="Send" Classes="accent" Click="OnSendClick" Margin="10,0,0,0" Height="36" MinWidth="75" IsEnabled="False"/>
+                                <Button Name="InterruptButton" Grid.Column="4" Content="Stop" Classes="danger" Click="OnInterruptClick" Margin="10,0,0,0" Height="36" MinWidth="75" IsEnabled="False" ToolTip.Tip="Halt active runner agentic loop"/>
+                            </Grid>
+                        </Border>
+
+                        <!-- E. Collapsible Server Log (Rotates logs under the viewport) -->
+                        <Border Grid.Row="5" Name="LogPanel" Height="140" Background="{StaticResource PanelAlt}" BorderBrush="{StaticResource Border}" BorderThickness="0,1,0,0" IsVisible="False">
+                            <Grid RowDefinitions="Auto,*">
+                                <Grid Grid.Row="0" Margin="12,6,12,4" ColumnDefinitions="*,Auto">
+                                    <TextBlock Text="System Execution Logs" Foreground="{StaticResource TextDim}" FontSize="11" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                                    <TextBlock Name="LogSummary" Grid.Column="1" Text="Engine listening: 11500" Foreground="{StaticResource TextDim}" FontSize="11"/>
+                                </Grid>
+                                <ScrollViewer Grid.Row="1" Margin="12,0,12,10" VerticalScrollBarVisibility="Auto">
+                                    <TextBox Name="LogBox" Background="Transparent" BorderThickness="0" Foreground="#A0C8C8C8" FontFamily="Consolas, monospace" FontSize="11.5" IsReadOnly="True" TextWrapping="Wrap"/>
+                                </ScrollViewer>
+                            </Grid>
+                        </Border>
+                    </Grid>
+                </Grid>
+            </TabItem>
+
+            <!-- =================== TAB 1: MODEL STORE =================== -->
+            <TabItem Header="Store">
+                <Grid RowDefinitions="Auto,Auto,Auto,Auto,Auto,*,Auto" Margin="24">
+                    <!-- A. Title -->
+                    <StackPanel Grid.Row="0" Margin="0,0,0,16">
+                        <TextBlock Text="Model Store" Foreground="{StaticResource Text}" FontSize="22" FontWeight="SemiBold"/>
+                        <TextBlock Text="Install and remove local Ollama models with a single click — no command line needed." Foreground="{StaticResource TextDim}" Margin="0,4,0,0"/>
+                    </StackPanel>
+
+                    <!-- B. Disk Summary -->
+                    <Border Grid.Row="1" Background="{StaticResource Panel}" BorderBrush="{StaticResource Border}" BorderThickness="1" CornerRadius="10" Padding="14,12" Margin="0,0,0,12">
+                        <Grid ColumnDefinitions="*,Auto">
+                            <TextBlock Name="DiskSummary" Grid.Column="0" VerticalAlignment="Center" Foreground="{StaticResource Text}" TextWrapping="Wrap" Text="Reading installed models..."/>
+                            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                                <Button Name="InstalledModelsButton" Content="Installed models" Classes="flat" Click="OnShowInstalledModels" ToolTip.Tip="List the models currently installed in the StayVibin Engine"/>
+                                <Button Name="GuideButton" Content="VRAM guide" Classes="flat" Margin="10,0,0,0" Click="OnOpenGuide" ToolTip.Tip="See model requirements by hardware tier"/>
+                                <Button Name="RefreshButton" Content="Refresh" Classes="flat" Margin="10,0,0,0" Click="OnRefresh" ToolTip.Tip="Re-scan local Ollama instances"/>
+                            </StackPanel>
+                        </Grid>
+                    </Border>
+
+                    <!-- C. Install custom model by name -->
+                    <Border Grid.Row="2" Background="{StaticResource Panel}" BorderBrush="{StaticResource Border}" BorderThickness="1" CornerRadius="10" Padding="14,12" Margin="0,0,0,12">
+                        <Grid ColumnDefinitions="Auto,*,Auto">
+                            <TextBlock Grid.Column="0" Text="Install by name" Classes="fieldLabel" Margin="0,0,16,0"/>
+                            <TextBox Name="InstallNameBox" Grid.Column="1" Classes="darkInput" KeyDown="OnInstallNameKeyDown" ToolTip.Tip="Type any Ollama tag, e.g. llama3:8b"/>
+                            <Button Name="InstallByNameButton" Grid.Column="2" Content="Install" Classes="accent" MinWidth="110" Margin="12,0,0,0" Click="OnInstallByName"/>
+                        </Grid>
+                    </Border>
+
+                    <!-- D. Active Pull Progress -->
+                    <Border Grid.Row="3" Name="ProgressPanel" IsVisible="False" Background="{StaticResource PanelAlt}" BorderBrush="{StaticResource Border}" BorderThickness="1" CornerRadius="10" Padding="14,12" Margin="0,0,0,12">
+                        <Grid ColumnDefinitions="*,Auto">
+                            <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                                <TextBlock Name="ProgressText" Foreground="{StaticResource Text}" Text="Working..." Margin="0,0,0,8"/>
+                                <ProgressBar Name="ProgressBarCtl" Classes="usageBar" Height="10"/>
+                            </StackPanel>
+                            <Button Name="StopInstallButton" Grid.Column="1" Content="Stop" Classes="danger" Padding="14,6" Margin="14,0,0,0" VerticalAlignment="Center" IsVisible="False" Click="OnStopInstall" ToolTip.Tip="Abort download"/>
+                        </Grid>
+                    </Border>
+
+                    <!-- E. Filters catalog -->
+                    <Border Grid.Row="4" Background="{StaticResource Panel}" BorderBrush="{StaticResource Border}" BorderThickness="1" CornerRadius="10" Padding="14,12" Margin="0,0,0,12">
+                        <Grid ColumnDefinitions="Auto,*,Auto,Auto,Auto">
+                            <TextBlock Grid.Column="0" Text="Filter" Classes="fieldLabel" Margin="0,0,16,0"/>
+                            <TextBox Name="SearchBox" Grid.Column="1" Classes="darkInput" TextChanged="OnSearchBoxTextChanged" ToolTip.Tip="Search catalog descriptions"/>
+                            <ComboBox Name="CategoryFilter" Grid.Column="2" MinWidth="140" Margin="12,0,0,0" SelectionChanged="OnFilterSelectionChanged" SelectedIndex="0">
+                                <ComboBoxItem Content="All categories"/>
+                                <ComboBoxItem Content="General"/>
+                                <ComboBoxItem Content="Coding"/>
+                                <ComboBoxItem Content="Reasoning"/>
+                                <ComboBoxItem Content="Vision"/>
+                            </ComboBox>
+                            <ComboBox Name="AccuracyFilter" Grid.Column="3" MinWidth="145" Margin="12,0,0,0" SelectionChanged="OnFilterSelectionChanged" SelectedIndex="0">
+                                <ComboBoxItem Content="Any accuracy"/>
+                                <ComboBoxItem Content="Tier 1: Max Accuracy"/>
+                                <ComboBoxItem Content="Tier 2: Strong Accuracy"/>
+                                <ComboBoxItem Content="Tier 3: Moderate Accuracy"/>
+                                <ComboBoxItem Content="Specialized Tools Only"/>
+                            </ComboBox>
+                        </Grid>
+                    </Border>
+
+                    <!-- F. Catalog model cards with colored tags. Installed models are
+                         sorted to the top (see ApplyStoreFilter). -->
+                    <ScrollViewer Grid.Row="5" VerticalScrollBarVisibility="Auto" Margin="0,0,0,12">
+                        <ItemsControl Name="CatalogGrid">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate DataType="{x:Type sv:CatalogRow}">
+                                    <Border Background="{StaticResource Panel}" BorderBrush="{StaticResource Border}" BorderThickness="1" CornerRadius="10" Padding="14,12" Margin="0,0,0,10">
+                                        <Grid ColumnDefinitions="*,Auto">
+                                            <StackPanel Grid.Column="0" Spacing="8">
+                                                <!-- Model name + tag chips -->
+                                                <WrapPanel VerticalAlignment="Center">
+                                                    <TextBlock Text="{Binding Name}" Foreground="{StaticResource Text}" FontSize="14" FontWeight="SemiBold" Margin="0,0,10,2" VerticalAlignment="Center"/>
+                                                    <Border Classes="chip chipOk" IsVisible="{Binding IsInstalled}" ToolTip.Tip="Installed locally">
+                                                        <StackPanel Orientation="Horizontal">
+                                                            <TextBlock Text="&#x2713;" FontFamily="Segoe UI Emoji"/>
+                                                            <TextBlock Text="Installed" Margin="4,0,0,0"/>
+                                                        </StackPanel>
+                                                    </Border>
+                                                    <Border Classes="chip chipAccent" IsVisible="{Binding Recommended}" ToolTip.Tip="Recommended for StayVibin's agentic workflow">
+                                                        <StackPanel Orientation="Horizontal">
+                                                            <TextBlock Text="&#x2B50;" FontFamily="Segoe UI Emoji"/>
+                                                            <TextBlock Text="Recommended" Margin="4,0,0,0"/>
+                                                        </StackPanel>
+                                                    </Border>
+                                                    <Border Classes="chip" BorderBrush="{Binding AccuracyBrush}" ToolTip.Tip="Estimated agentic-coding accuracy">
+                                                        <TextBlock Text="{Binding AccuracyDisplay}" Foreground="{Binding AccuracyBrush}"/>
+                                                    </Border>
+                                                    <Border Classes="chip" ToolTip.Tip="Model category">
+                                                        <TextBlock Text="{Binding Category}"/>
+                                                    </Border>
+                                                    <Border Classes="chip" ToolTip.Tip="Approximate VRAM at Q4 quantization">
+                                                        <TextBlock Text="{Binding VramDisplay}"/>
+                                                    </Border>
+                                                </WrapPanel>
+                                                <TextBlock Text="{Binding Description}" Foreground="{StaticResource TextDim}" FontSize="12" TextWrapping="Wrap"/>
+                                            </StackPanel>
+                                            <Button Grid.Column="1" Content="{Binding ActionText}" Classes="flat" VerticalAlignment="Center" Margin="14,0,0,0" MinWidth="92" Padding="12,6" Click="OnModelActionClick"/>
+                                        </Grid>
+                                    </Border>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </ScrollViewer>
+
+                    <!-- Footer notice -->
+                    <TextBlock Grid.Row="6" Text="Accuracy rating based on universal multi-format tool-calling benchmarks." Foreground="{StaticResource TextDim}" FontSize="11.5" HorizontalAlignment="Center"/>
+
+                    <!-- Installed Models overlay: opens INSIDE the Store tab (no separate
+                         window). Lists every installed model with its size and a per-row
+                         Remove button, plus a running total. Spans the whole tab and dims
+                         the content behind it; toggled from code-behind. -->
+                    <Border Grid.Row="0" Grid.RowSpan="7" Name="InstalledOverlay" IsVisible="False"
+                            Background="#CC0A0E0E" Margin="-24">
+                        <Border Background="{StaticResource Panel}" BorderBrush="{StaticResource Border}" BorderThickness="1"
+                                CornerRadius="12" Margin="40" MaxWidth="760" MaxHeight="600"
+                                HorizontalAlignment="Center" VerticalAlignment="Center">
+                            <Grid RowDefinitions="Auto,Auto,*,Auto">
+                                <!-- Header -->
+                                <Grid Grid.Row="0" ColumnDefinitions="*,Auto" Margin="18,16,12,8">
+                                    <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                                        <TextBlock Text="Installed Models" FontSize="18" FontWeight="SemiBold" Foreground="{StaticResource Text}"/>
+                                        <TextBlock Name="InstalledOverlaySummary" Text="" FontSize="12" Foreground="{StaticResource TextDim}" Margin="0,2,0,0"/>
+                                    </StackPanel>
+                                    <Button Grid.Column="1" Content="&#x2715;" Classes="flat" Padding="10,4" VerticalAlignment="Top" Click="OnCloseInstalledModels" ToolTip.Tip="Close"/>
+                                </Grid>
+
+                                <!-- Status line: busy / error / empty state. -->
+                                <TextBlock Grid.Row="1" Name="InstalledOverlayStatus" IsVisible="False" Margin="18,0,18,8"
+                                           FontSize="12.5" TextWrapping="Wrap" Foreground="{StaticResource TextDim}"/>
+
+                                <!-- Scrollable list of installed models. -->
+                                <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto" Margin="14,0,14,0">
+                                    <ItemsControl Name="InstalledList">
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate DataType="{x:Type sv:InstalledModelRow}">
+                                                <Border Background="{StaticResource PanelAlt}" BorderBrush="{StaticResource Border}" BorderThickness="1" CornerRadius="8" Padding="12,10" Margin="4,4">
+                                                    <Grid ColumnDefinitions="*,Auto,Auto">
+                                                        <TextBlock Grid.Column="0" Text="{Binding Name}" Foreground="{StaticResource Text}" FontSize="13" FontWeight="SemiBold" VerticalAlignment="Center" TextWrapping="Wrap"/>
+                                                        <Border Grid.Column="1" Classes="chip" VerticalAlignment="Center" Margin="0,0,12,0" ToolTip.Tip="On-disk size">
+                                                            <TextBlock Text="{Binding SizeDisplay}"/>
+                                                        </Border>
+                                                        <Button Grid.Column="2" Content="Remove" Classes="danger" Padding="12,5" VerticalAlignment="Center" Click="OnRemoveInstalledModel" ToolTip.Tip="Delete this model from disk"/>
+                                                    </Grid>
+                                                </Border>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                </ScrollViewer>
+
+                                <!-- Footer: running total + close. -->
+                                <Border Grid.Row="3" BorderBrush="{StaticResource Border}" BorderThickness="0,1,0,0" Padding="16,10">
+                                    <Grid ColumnDefinitions="*,Auto">
+                                        <TextBlock Name="InstalledOverlayTotal" Grid.Column="0" Text="" Foreground="{StaticResource TextDim}" FontSize="12" VerticalAlignment="Center"/>
+                                        <Button Grid.Column="1" Content="Close" Classes="flat" Padding="16,6" Click="OnCloseInstalledModels"/>
+                                    </Grid>
+                                </Border>
+                            </Grid>
+                        </Border>
+                    </Border>
+                </Grid>
+            </TabItem>
+
+            <!-- =================== TAB 2: SETTINGS =================== -->
+            <TabItem Header="Settings">
+                <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="28,20">
+                    <StackPanel Spacing="16" MaxWidth="920" HorizontalAlignment="Left">
+                        <!-- Header -->
+                        <StackPanel Margin="0,0,0,12">
+                            <TextBlock Text="Settings &amp; Optimizations" Foreground="{StaticResource Text}" FontSize="22" FontWeight="SemiBold"/>
+                            <TextBlock Text="Configure Ollama model-tuning baselines, local server routes, and GPU VRAM performance features." Foreground="{StaticResource TextDim}"/>
+                        </StackPanel>
+
+                        <!-- Part 1: Model and LLM parameters -->
+                        <TextBlock Text="Model and LLM" Classes="sectionHeader" Margin="0,6,0,6"/>
+                        <Grid ColumnDefinitions="190,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto" Margin="0,0,0,12">
+                            <TextBlock Grid.Row="0" Grid.Column="0" Text="Default model" Classes="fieldLabel" Height="40"/>
+                            <ComboBox Name="ModelBox" Grid.Row="0" Grid.Column="1" Classes="darkCombo" HorizontalAlignment="Stretch" ToolTip.Tip="Default model tag deployed on session creation"/>
+
+                            <TextBlock Grid.Row="1" Grid.Column="0" Text="API key" Classes="fieldLabel" Height="40" Margin="0,8,0,0"/>
+                            <TextBox Name="ApiKeyBox" Grid.Row="1" Grid.Column="1" Classes="darkInput" Margin="0,8,0,0" ToolTip.Tip="Set 'local-llm' for Ollama, or custom cloud credentials"/>
+
+                            <TextBlock Grid.Row="2" Grid.Column="0" Text="LLM base URL" Classes="fieldLabel" Height="40" Margin="0,8,0,0"/>
+                            <TextBox Name="BaseUrlBox" Grid.Row="2" Grid.Column="1" Classes="darkInput" Margin="0,8,0,0" ToolTip.Tip="Endpoint URL connecting to custom engines"/>
+
+                            <TextBlock Grid.Row="3" Grid.Column="0" Text="Temperature" Classes="fieldLabel" Height="40" Margin="0,8,0,0"/>
+                            <TextBox Name="TemperatureBox" Grid.Row="3" Grid.Column="1" Classes="darkInput" Margin="0,8,0,0" ToolTip.Tip="Control model creativity (leave blank for default)"/>
+
+                            <TextBlock Grid.Row="4" Grid.Column="0" Text="Reasoning effort" Classes="fieldLabel" Height="40" Margin="0,8,0,0"/>
+                            <ComboBox Name="ReasoningBox" Grid.Row="4" Grid.Column="1" Classes="darkCombo" Margin="0,8,0,0" Width="180" HorizontalAlignment="Left">
+                                <ComboBoxItem Content="high"/>
+                                <ComboBoxItem Content="medium"/>
+                                <ComboBoxItem Content="low"/>
+                                <ComboBoxItem Content="none"/>
+                            </ComboBox>
+
+                            <TextBlock Grid.Row="5" Grid.Column="0" Text="Auto-compact at (events)" Classes="fieldLabel" Height="40" Margin="0,8,0,0"/>
+                            <TextBox Name="CondenserBox" Grid.Row="5" Grid.Column="1" Classes="darkInput" Margin="0,8,0,0" Width="180" HorizontalAlignment="Left" ToolTip.Tip="Summarize chat once it exceeds this event boundary count"/>
+                        </Grid>
+
+                        <CheckBox Name="AutoCompactBox" Content="Auto-compact context when the limit is reached" Foreground="{StaticResource Text}" ToolTip.Tip="When off, the conversation is only compacted when you click the context ring"/>
+
+                        <CheckBox Name="NonNativeBox" Content="Force prompt-based tool calling (recommended for local models)" Foreground="{StaticResource Text}" ToolTip.Tip="Uses structured prompt blocks instead of native JSON tokens"/>
+
+                        <!-- Part 2: GPU VRAM Optimizations -->
+                        <TextBlock Text="Engine GPU &amp; VRAM Optimization" Classes="sectionHeader" Margin="0,16,0,6"/>
+
+                        <!-- Compute device: pick GPU (default) or force CPU-only for
+                             machines without a capable GPU. -->
+                        <Grid ColumnDefinitions="190,*" Margin="0,0,0,2">
+                            <TextBlock Grid.Column="0" Text="Compute device" Classes="fieldLabel" Height="40"/>
+                            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="20" VerticalAlignment="Center">
+                                <RadioButton Name="DeviceGpuRadio" GroupName="ComputeDevice" Content="GPU (recommended)" IsChecked="True" Foreground="{StaticResource Text}" ToolTip.Tip="Run on the GPU; layers that exceed VRAM automatically spill to the CPU"/>
+                                <RadioButton Name="DeviceCpuRadio" GroupName="ComputeDevice" Content="CPU only" Foreground="{StaticResource Text}" ToolTip.Tip="Run entirely on the CPU using system RAM"/>
+                            </StackPanel>
+                        </Grid>
+                        <TextBlock Text="CPU only runs models on your processor and system RAM. It works without a good GPU but is much slower. Takes effect after the engine restarts."
+                                   TextWrapping="Wrap" FontSize="11" Foreground="{StaticResource Warn}" Margin="0,0,0,4"
+                                   IsVisible="{Binding #DeviceCpuRadio.IsChecked}"/>
+                        <TextBlock Text="Recommended for CPU mode: a modern multi-core CPU with AVX2 (Intel 8th-gen Core / AMD Ryzen 2000 or newer), 16 GB+ RAM (32 GB+ for larger models), and fast dual-channel memory (DDR4-3200 or DDR5). CPU speed is limited mainly by memory bandwidth, so faster dual-channel RAM and AVX2/AVX-512 matter more than clock speed or cache size."
+                                   TextWrapping="Wrap" FontSize="11" Foreground="{StaticResource TextDim}" Margin="0,0,0,10"
+                                   IsVisible="{Binding #DeviceCpuRadio.IsChecked}"/>
+
+                        <Grid ColumnDefinitions="190,*" RowDefinitions="Auto,Auto" Margin="0,0,0,12">
+                            <TextBlock Grid.Row="0" Grid.Column="0" Text="Context VRAM Saver" Classes="fieldLabel" Height="40"/>
+                            <ComboBox Name="KvCacheBox" Grid.Row="0" Grid.Column="1" Classes="darkCombo" Width="280" HorizontalAlignment="Left" ToolTip.Tip="Compress context history memory in VRAM (KV Cache Quantization)">
+                                <ComboBoxItem Content="Disabled (Standard f16)" Tag="f16"/>
+                                <ComboBoxItem Content="Medium Quantization (q8_0)" Tag="q8_0"/>
+                                <ComboBoxItem Content="Maximum Quantization (q4_0)" Tag="q4_0"/>
+                            </ComboBox>
+
+                            <TextBlock Grid.Row="1" Grid.Column="0" Text="Flash Attention" Classes="fieldLabel" Height="40" Margin="0,8,0,0"/>
+                            <CheckBox Name="FlashAttentionBox" Grid.Row="1" Grid.Column="1" Margin="0,8,0,0" Foreground="{StaticResource Text}" Content="Enable Flash Attention (saves VRAM and boosts speed)" ToolTip.Tip="Optimizes parallel GPU attention matrix math, drastically lowering context overhead"/>
+                        </Grid>
+
+                        <!-- Part 3: Connections -->
+                        <TextBlock Text="Connection" Classes="sectionHeader" Margin="0,16,0,6"/>
+                        <Grid ColumnDefinitions="190,*,Auto" RowDefinitions="Auto,Auto,Auto,Auto" Margin="0,0,0,12">
+                            <TextBlock Grid.Row="0" Grid.Column="0" Text="Agent-server host" Classes="fieldLabel" Height="40"/>
+                            <TextBox Name="HostBox" Grid.Row="0" Grid.Column="1" Grid.ColumnSpan="2" Classes="darkInput"/>
+
+                            <TextBlock Grid.Row="1" Grid.Column="0" Text="Agent-server port" Classes="fieldLabel" Height="40" Margin="0,8,0,0"/>
+                            <TextBox Name="PortBox" Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="2" Classes="darkInput" Margin="0,8,0,0"/>
+
+                            <TextBlock Grid.Row="2" Grid.Column="0" Text="Ollama URL" Classes="fieldLabel" Height="40" Margin="0,8,0,0"/>
+                            <TextBox Name="OllamaBox" Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="2" Classes="darkInput" Margin="0,8,0,0"/>
+
+                            <TextBlock Grid.Row="3" Grid.Column="0" Text="agent-server.exe path" Classes="fieldLabel" Height="40" Margin="0,8,0,0"/>
+                            <TextBox Name="ExePathBox" Grid.Row="3" Grid.Column="1" Classes="darkInput" Margin="0,8,0,0" ToolTip.Tip="Point to standard Python environment executable (leave blank for uv)"/>
+                            <Button Name="BrowseExeButton" Grid.Row="3" Grid.Column="2" Content="..." Classes="flat" Margin="10,8,0,0" Padding="12,5" Click="OnBrowseExe"/>
+                        </Grid>
+
+                        <!-- Part 4: Behaviors -->
+                        <TextBlock Text="Behavior" Classes="sectionHeader" Margin="0,16,0,6"/>
+                        <Grid ColumnDefinitions="190,*" RowDefinitions="Auto,Auto,Auto" Margin="0,0,0,24">
+                            <TextBlock Grid.Row="0" Grid.Column="0" Text="Max context (blank = auto)" Classes="fieldLabel" Height="40"/>
+                            <TextBox Name="ContextLenBox" Grid.Row="0" Grid.Column="1" Classes="darkInput" ToolTip.Tip="Blank uses the selected model's default maximum context length"/>
+
+                            <TextBlock Grid.Row="1" Grid.Column="0" Text="Max loop iterations" Classes="fieldLabel" Height="40" Margin="0,8,0,0"/>
+                            <TextBox Name="MaxIterBox" Grid.Row="1" Grid.Column="1" Classes="darkInput" Margin="0,8,0,0" ToolTip.Tip="Cutoff barrier limit protecting against loop runaway"/>
+
+                            <TextBlock Grid.Row="2" Grid.Column="0" Text="Default working folder" Classes="fieldLabel" Height="40" Margin="0,8,0,0"/>
+                            <TextBox Name="WorkDirBox" Grid.Row="2" Grid.Column="1" Classes="darkInput" Margin="0,8,0,0" ToolTip.Tip="Working folder where the agent reads and edits files"/>
+                        </Grid>
+
+                        <!-- Save settings action -->
+                        <Button Name="SaveSettingsBtn" Content="Save &amp; Apply Configurations" Classes="accent" Click="OnSaveSettings" HorizontalAlignment="Right" Padding="18,8" FontSize="13.5"/>
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+        </TabControl>
+    </Grid>
+</Window>

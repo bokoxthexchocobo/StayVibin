@@ -11,7 +11,10 @@ namespace StayVibin.Services;
 public static class WorkspaceContextService
 {
     private const int MaxDirtyFiles = 25;
-    private const int MaxTopEntries = 40;
+    private const int MaxTopEntries = 80;
+    private const int MaxKeyFiles = 24;
+    private const int MaxFolderSummaries = 16;
+    private const int MaxFolderChildren = 8;
 
     /// <summary>
     /// Snapshot text appended ahead of the agentic rules. Returns empty if the
@@ -37,6 +40,12 @@ public static class WorkspaceContextService
 
         var layout = BuildTopLevelLayout(workingDir);
         if (layout.Length > 0) sb.AppendLine($"- Top level: {layout}");
+
+        var keyFiles = BuildKeyFiles(workingDir);
+        if (keyFiles.Length > 0) sb.AppendLine($"- Key files: {keyFiles}");
+
+        var folderMap = BuildFolderMap(workingDir);
+        if (folderMap.Length > 0) sb.AppendLine($"- Folder map: {folderMap}");
 
         if (!string.IsNullOrWhiteSpace(editorPath) && File.Exists(editorPath))
         {
@@ -94,6 +103,76 @@ public static class WorkspaceContextService
         catch { return ""; }
 
         return parts.Count == 0 ? "" : string.Join(", ", parts);
+    }
+
+    private static string BuildKeyFiles(string workingDir)
+    {
+        var names = new[]
+        {
+            "*.sln", "*.csproj", "CMakeLists.txt", "cmake.toml", "go.mod",
+            "Cargo.toml", "package.json", "pyproject.toml", "requirements.txt",
+            "README*", "AGENTS.md"
+        };
+
+        var files = new List<string>();
+        try
+        {
+            foreach (var pattern in names)
+            {
+                foreach (var path in Directory.GetFiles(workingDir, pattern, SearchOption.TopDirectoryOnly)
+                             .OrderBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase))
+                {
+                    files.Add(TryRelative(workingDir, path));
+                    if (files.Count >= MaxKeyFiles) return string.Join(", ", files);
+                }
+            }
+
+            var rulesDir = Path.Combine(workingDir, ".cursor", "rules");
+            if (Directory.Exists(rulesDir))
+            {
+                foreach (var path in Directory.GetFiles(rulesDir, "*.mdc", SearchOption.TopDirectoryOnly)
+                             .OrderBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase))
+                {
+                    files.Add(TryRelative(workingDir, path));
+                    if (files.Count >= MaxKeyFiles) return string.Join(", ", files);
+                }
+            }
+        }
+        catch { return ""; }
+
+        return files.Count == 0 ? "" : string.Join(", ", files);
+    }
+
+    private static string BuildFolderMap(string workingDir)
+    {
+        var summaries = new List<string>();
+        try
+        {
+            foreach (var dir in Directory.GetDirectories(workingDir)
+                         .OrderBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase))
+            {
+                var name = Path.GetFileName(dir);
+                if (WorkspaceExplorer.Ignored.Contains(name)) continue;
+
+                var children = Directory.GetFileSystemEntries(dir)
+                    .Where(p => !WorkspaceExplorer.Ignored.Contains(Path.GetFileName(p)))
+                    .OrderBy(p => Directory.Exists(p) ? 0 : 1)
+                    .ThenBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase)
+                    .Take(MaxFolderChildren)
+                    .Select(p => Directory.Exists(p)
+                        ? Path.GetFileName(p) + "/"
+                        : Path.GetFileName(p))
+                    .ToList();
+
+                summaries.Add(children.Count == 0
+                    ? $"{name}/"
+                    : $"{name}/({string.Join(", ", children)})");
+                if (summaries.Count >= MaxFolderSummaries) break;
+            }
+        }
+        catch { return ""; }
+
+        return summaries.Count == 0 ? "" : string.Join("; ", summaries);
     }
 
     private static async Task<string?> BuildToolingLineAsync()

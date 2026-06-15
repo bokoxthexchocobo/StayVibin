@@ -67,6 +67,8 @@ public sealed class BackendManager : IDisposable
 
     public async Task<bool> StartAsync(TimeSpan timeout, CancellationToken ct = default)
     {
+        AgentSpecProvider.ClearAvailableOptionalTools();
+
         // Write our Python helper modules and kick off the tool-registry probe in
         // parallel with server startup. The probe tells us which optional/alias
         // tools the engine actually has registered, so AgentSpecProvider only puts

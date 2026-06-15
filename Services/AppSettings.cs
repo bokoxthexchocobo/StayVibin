@@ -31,6 +31,18 @@ public enum PermissionMode
 }
 
 /// <summary>
+/// Where the engine runs model inference. Gpu (default) offloads as many layers as
+/// fit into VRAM and automatically spills the remainder to the CPU. Cpu hides all
+/// accelerators from the engine so inference runs purely on the CPU using system
+/// RAM - works without a capable GPU but is much slower.
+/// </summary>
+public enum ComputeDevice
+{
+    Gpu,
+    Cpu
+}
+
+/// <summary>
 /// App-level preferences (connection + behavior) persisted to
 /// %APPDATA%\StayVibin\settings.json. Model/LLM details live in
 /// ~/.openhands/agent_settings.json and are edited separately.
@@ -69,10 +81,37 @@ public sealed class AppSettings
     public int MaxIterations { get; set; } = 500;
 
     /// <summary>
+    /// VRAM Optimization: Type of quantization for the context memory (KV Cache).
+    /// Allowed values: "f16" (Standard, stable), "q8_0" (Medium savings), "q4_0" (Maximum savings).
+    /// </summary>
+    public string KvCacheType { get; set; } = "f16";
+
+    /// <summary>
+    /// Whether to force enable Flash Attention on the engine.
+    /// </summary>
+    public bool EnableFlashAttention { get; set; } = true;
+
+    /// <summary>
+    /// Which hardware the engine uses for inference. Defaults to GPU. Stored as a
+    /// string for a readable settings.json. Changing this only takes effect after
+    /// the engine restarts (the engine is relaunched when this differs from the
+    /// running instance).
+    /// </summary>
+    [JsonConverter(typeof(JsonStringEnumConverter))]
+    public ComputeDevice ComputeDevice { get; set; } = ComputeDevice.Gpu;
+
+    /// <summary>
     /// When true, picking/starting a model auto-applies sensible temperature,
     /// reasoning effort and context size detected from Ollama (newbie-friendly).
     /// </summary>
     public bool AutoTune { get; set; } = true;
+
+    /// <summary>
+    /// When true, the conversation is summarized automatically once history grows
+    /// past the condenser threshold. When false, compaction only happens when the
+    /// user clicks the context ring. Defaults to on.
+    /// </summary>
+    public bool AutoCompact { get; set; } = true;
 
     /// <summary>
     /// How the agent plans before acting. Stored as a string for a readable,
@@ -134,6 +173,13 @@ public sealed class AppSettings
         if (string.IsNullOrWhiteSpace(Host)) Host = "127.0.0.1";
         if (string.IsNullOrWhiteSpace(OllamaUrl) || IsLegacyDefaultOllamaUrl(OllamaUrl))
             OllamaUrl = StayVibinEngineManager.DefaultBaseUrl;
+
+        var k = (KvCacheType ?? "").Trim().ToLowerInvariant();
+        if (k != "f16" && k != "q8_0" && k != "q4_0")
+            KvCacheType = "f16";
+        else
+            KvCacheType = k;
+
         return this;
     }
 

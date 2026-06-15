@@ -3,7 +3,7 @@
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File .\build-installer.ps1
-#   powershell -ExecutionPolicy Bypass -File .\build-installer.ps1 -Version 1.0.0
+#   powershell -ExecutionPolicy Bypass -File .\build-installer.ps1 -Version 2.0.0
 
 param(
     [string]$Version = "",
@@ -72,7 +72,14 @@ try {
         & (Join-Path $Root "publish.ps1") -Runtime $Runtime
     }
 
-    $publishedExe = Join-Path $Root "bin\Release\net10.0-windows\$Runtime\publish\StayVibin.exe"
+    # Resolve the published exe robustly (the TFM folder is net10.0 post-Avalonia,
+    # was net10.0-windows under WPF). Search rather than hardcode the moniker.
+    $publishedExe = Get-ChildItem -Path (Join-Path $Root "bin\Release") -Recurse -Filter "StayVibin.exe" -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -like "*\$Runtime\publish\StayVibin.exe" } |
+        Select-Object -First 1 -ExpandProperty FullName
+    if (-not $publishedExe) {
+        $publishedExe = Join-Path $Root "bin\Release\net10.0\$Runtime\publish\StayVibin.exe"
+    }
     if (-not (Test-Path $publishedExe)) {
         throw "Published executable not found: $publishedExe`nRun publish.ps1 first or omit -SkipPublish."
     }

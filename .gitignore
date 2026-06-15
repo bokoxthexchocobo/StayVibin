@@ -12,3 +12,8 @@ tools/inno/
 # Local runtime data (agent sessions, logs)
 workspace/
 *.log
+
+# Bundled StayVibin Engine payload (~1.6 GB of binaries). Not source: it is staged
+# into the publish output / installer at build time from the local engine build, so
+# it must never be committed to the repo.
+Engine/

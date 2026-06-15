@@ -3,14 +3,16 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text.Json.Nodes;
-using System.Windows;
-using System.Windows.Controls;
-using System.Windows.Input;
-using System.Windows.Media;
-using System.Windows.Media.Animation;
-using System.Windows.Media.Imaging;
-using ICSharpCode.AvalonEdit.Highlighting;
-using Microsoft.Win32;
+using System.Text.RegularExpressions;
+using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Input;
+using Avalonia.Layout;
+using Avalonia.Media;
+using Avalonia.Media.Imaging;
+using Avalonia.Threading;
+using Avalonia.Interactivity;
+using AvaloniaEdit.Highlighting;
 using StayVibin.Models;
 using StayVibin.Services;
 
@@ -67,6 +69,7 @@ public partial class MainWindow : Window
     // Conversation history sidebar. Conversations are persisted by the agent-server;
     // these rows mirror that list. _activeConversationId is the one currently open.
     private readonly ObservableCollection<ConversationRow> _conversations = new();
+    private readonly HashSet<string> _hiddenConversationIds = new(StringComparer.OrdinalIgnoreCase);
     private string? _activeConversationId;
     private bool _suppressConvSelection;   // ignore ListBox selection we set in code
     private string? _pendingTitleConvId;   // refresh the list once this new chat is titled
@@ -78,18 +81,34 @@ public partial class MainWindow : Window
     private bool _populatingModels;
     private readonly SemaphoreSlim _modelLoadLock = new(1, 1);   // serialize PopulateModelsAsync
     private readonly HashSet<string> _modelAdviceShown = new(StringComparer.OrdinalIgnoreCase);
+    private int _engineContext;
+
+    // ---- Model Store Fields ----
+    private readonly ObservableCollection<CatalogRow> _availableStoreModels = new();
+    // Rows shown in the in-form "Installed Models" overlay.
+    private readonly ObservableCollection<InstalledModelRow> _installedModels = new();
+    // Guards the Installed Models overlay against overlapping refresh/remove actions.
+    private bool _installedPanelBusy;
+    private bool _storeBusy;
+    private readonly CancellationTokenSource _storeCts = new();
+    private CancellationTokenSource? _pullCts;
+
+    // ---- Settings Fields ----
+    private JsonNode? _settingsSpec;
 
     public MainWindow()
     {
         InitializeComponent();
         ChatList.ItemsSource = _chat;
         ConversationList.ItemsSource = _conversations;
+        CatalogGrid.ItemsSource = _availableStoreModels;
+        InstalledList.ItemsSource = _installedModels;
 
         _backend = BuildBackend();
         _engine = BuildEngineManager();
         _workingDir = _settings.EffectiveWorkingDir;
         WorkDirButton.Content = ShortPath(_workingDir);
-        WorkDirButton.ToolTip = _workingDir;
+        ToolTip.SetTip(WorkDirButton, _workingDir);
 
         if (AgentSpecProvider.SettingsExist)
         {
@@ -123,9 +142,9 @@ public partial class MainWindow : Window
         Loaded += OnWindowLoaded;
 
         // Explorer: populate children lazily on expand; double-click opens a file.
-        FileTree.AddHandler(TreeViewItem.ExpandedEvent, new RoutedEventHandler(OnTreeItemExpanded));
+        FileTree.AddHandler(TreeViewItem.ExpandedEvent, OnTreeItemExpanded);
         CodeEditor.TextChanged += OnEditorTextChanged;
-        CodeEditor.PreviewKeyDown += OnEditorKeyDown;
+        CodeEditor.KeyDown += OnEditorKeyDown;
 
         _ = StartEngineAndPopulateModelsAsync();
         _ = UpdateRepoBadgeAsync();
@@ -178,7 +197,7 @@ public partial class MainWindow : Window
 
         if (models is null || models.Count == 0)
         {
-            ModelSuggestionBar.Visibility = Visibility.Collapsed;
+            ModelSuggestionBar.IsVisible = false;
             return;
         }
 
@@ -187,11 +206,11 @@ public partial class MainWindow : Window
             var btn = new Button
             {
                 Content = "Install " + model,
-                Style = (Style)FindResource("AccentButton"),
                 Margin = new Thickness(0, 0, 8, 0),
-                ToolTip = $"Download {model} in the Model Store (no commands needed)",
                 Tag = model,
             };
+            btn.Classes.Add("accent");
+            ToolTip.SetTip(btn, $"Download {model} in the Model Store (no commands needed)");
             btn.Click += OnInstallSuggestion;
             ModelSuggestionButtons.Children.Add(btn);
         }
@@ -199,45 +218,56 @@ public partial class MainWindow : Window
         var store = new Button
         {
             Content = "Open Store",
-            Style = (Style)FindResource("FlatButton"),
             Margin = new Thickness(0, 0, 8, 0),
-            ToolTip = "Browse and manage all models",
         };
-        store.Click += async (_, _) => await OpenModelStoreAsync();
+        store.Classes.Add("flat");
+        ToolTip.SetTip(store, "Browse and manage all models");
+        store.Click += (_, _) =>
+        {
+            MainTabControl.SelectedIndex = 1; // Switch to Store Tab
+            TabChatBtn.Classes.Remove("active");
+            TabStoreBtn.Classes.Add("active");
+        };
         ModelSuggestionButtons.Children.Add(store);
 
         var dismiss = new Button
         {
             Content = "Dismiss",
-            Style = (Style)FindResource("FlatButton"),
-            ToolTip = "Hide this suggestion",
         };
+        dismiss.Classes.Add("flat");
+        ToolTip.SetTip(dismiss, "Hide this suggestion");
         dismiss.Click += (_, _) => HideModelSuggestions();
         ModelSuggestionButtons.Children.Add(dismiss);
 
-        ModelSuggestionBar.Visibility = Visibility.Visible;
+        ModelSuggestionBar.IsVisible = true;
     }
 
     private void HideModelSuggestions()
     {
-        ModelSuggestionBar.Visibility = Visibility.Collapsed;
+        ModelSuggestionBar.IsVisible = false;
         ModelSuggestionButtons.Children.Clear();
     }
 
     /// <summary>Install button in the suggestion bar: open the store and pull it.</summary>
-    private async void OnInstallSuggestion(object sender, RoutedEventArgs e)
+    private async void OnInstallSuggestion(object? sender, RoutedEventArgs e)
     {
         if (sender is not Button { Tag: string model } || string.IsNullOrWhiteSpace(model))
             return;
 
         HideModelSuggestions();
-        await OpenModelStoreAsync(model);
+        MainTabControl.SelectedIndex = 1; // Switch to Model Store Tab
+        TabChatBtn.Classes.Remove("active");
+        TabStoreBtn.Classes.Add("active");
+        await InstallStoreAsync(model);
     }
 
-    private async void OnWindowLoaded(object sender, RoutedEventArgs e)
+    private async void OnWindowLoaded(object? sender, RoutedEventArgs e)
     {
         Loaded -= OnWindowLoaded;   // run once
         PromptInstallGitIfMissing();
+
+        LoadSettingsToUi();
+        _ = RefreshStoreAsync();
 
         // First run: no model configured yet - walk the user through provider setup
         // so they never have to hand-write agent_settings.json.
@@ -254,22 +284,18 @@ public partial class MainWindow : Window
     {
         if (AgentSpecProvider.SettingsExist) return true;
 
-        var dlg = new ProviderSetupWindow(_settings) { Owner = this };
-        if (dlg.ShowDialog() != true)
-        {
-            AddSystem("No AI provider configured yet. Press Start (or open Settings) to set one up.");
-            return false;
-        }
-
-        // Keep the app's Ollama URL in sync with what the user entered.
-        _settings.OllamaUrl = dlg.OllamaUrl;
-        _settings.Save();
-        _ollama?.Dispose();
-        _ollama = new OllamaClient(_settings.OllamaUrl);
-
         try
         {
-            AgentSpecProvider.CreateDefault(dlg.Model, dlg.OllamaUrl);
+            // Auto-configure the bundled StayVibin Engine as the default provider so
+            // the app never depends on a separately-installed Ollama.
+            AgentSpecProvider.CreateDefault("qwen2.5-coder:7b", StayVibinEngineManager.DefaultBaseUrl);
+
+            // Keep the app's engine URL in sync.
+            _settings.OllamaUrl = StayVibinEngineManager.DefaultBaseUrl;
+            _settings.Save();
+            _ollama?.Dispose();
+            _ollama = new OllamaClient(_settings.OllamaUrl);
+
             var spec = AgentSpecProvider.Load();
             _llmTemplate = JsonNode.Parse(spec["llm"]!.ToJsonString());
             _selectedModel = StripProvider(AgentSpecProvider.DescribeModel(spec));
@@ -280,8 +306,13 @@ public partial class MainWindow : Window
             return false;
         }
 
+        await MessageBox.ShowAsync(this, 
+            "We've automatically configured StayVibin to use the bundled StayVibin Engine with a default model (qwen2.5-coder:7b).\n\n" +
+            "Open the Models tab to download a model, then change the model, API key, base URL, and other parameters in the Settings tab at any time!",
+            "Welcome to StayVibin!");
+
         await PopulateModelsAsync();
-        AddSystem($"Configured Ollama with model {dlg.Model}. Press Start to begin.");
+        AddSystem("Configured the StayVibin Engine with model qwen2.5-coder:7b. Open the Models tab to download it, then press Start.");
         return true;
     }
 
@@ -297,7 +328,7 @@ public partial class MainWindow : Window
         if (StayVibinEngineManager.IsDefaultEngineUrl(_settings.OllamaUrl))
         {
             _engine ??= BuildEngineManager();
-            SetStatus("Starting StayVibin Engine...", AppDot.Connecting);
+            SetStatus("Starting SV Engine...", AppDot.Connecting);
             if (!await _engine.StartAsync(TimeSpan.FromSeconds(60)))
             {
                 AddError($"StayVibin Engine is not reachable at {_settings.OllamaUrl}.\n"
@@ -331,8 +362,22 @@ public partial class MainWindow : Window
         return b;
     }
 
-    private StayVibinEngineManager BuildEngineManager()
-        => new(contextLength: _settings.BackendContextLength);
+    private StayVibinEngineManager BuildEngineManager(int? contextLength = null)
+    {
+        _engineContext = contextLength ?? _settings.BackendContextLength;
+        var e = new StayVibinEngineManager(contextLength: _engineContext, device: _settings.ComputeDevice);
+        // Mirror the engine's stdout/stderr into the in-app Server log (and the log
+        // file) the same way the backend does, so engine startup/CUDA failures are
+        // visible to the user instead of only landing in the engine-*.log file.
+        e.LogLine += OnBackendLog;
+        return e;
+    }
+
+    private void RebuildEngineManager(int? contextLength = null)
+    {
+        try { _engine?.Dispose(); } catch { }
+        _engine = BuildEngineManager(contextLength);
+    }
 
     /// <summary>Tear down the old backend (unsubscribe log handler) and spawn a fresh one.</summary>
     private void RebuildBackend()
@@ -367,64 +412,6 @@ public partial class MainWindow : Window
         catch { return string.Equals(a, b, StringComparison.OrdinalIgnoreCase); }
     }
 
-    private async void OnSettingsClick(object sender, RoutedEventArgs e)
-    {
-        // Don't let settings (which can dispose/rebuild the backend) run while a
-        // Start/Stop is mid-flight.
-        if (_busy) return;
-
-        await EnsureOllamaRunningAsync();
-        var models = _ollama is null
-            ? (IReadOnlyList<string>)Array.Empty<string>()
-            : await _ollama.ListModelsAsync();
-
-        var dlg = new SettingsWindow(_settings, models) { Owner = this };
-        if (dlg.ShowDialog() != true) return;
-
-        // Reload everything that settings can affect.
-        _settings = AppSettings.Load();
-
-        _ollama?.Dispose();
-        _ollama = new OllamaClient(_settings.OllamaUrl);
-        // _assumedContextWindow is resolved per-model by RefreshAssumedContextWindowAsync below.
-
-        if (_client is null)
-        {
-            // No active session: rebuild the backend so host/port/path/context apply,
-            // rebuild the engine so context/URL apply, and refresh the default
-            // working dir.
-            RebuildBackend();
-            try { _engine?.Dispose(); } catch { }
-            _engine = BuildEngineManager();
-
-            _workingDir = _settings.EffectiveWorkingDir;
-            WorkDirButton.Content = ShortPath(_workingDir);
-            WorkDirButton.ToolTip = _workingDir;
-            _ = RefreshTreeAsync();
-
-            if (AgentSpecProvider.SettingsExist)
-            {
-                try
-                {
-                    var spec = AgentSpecProvider.Load();
-                    _llmTemplate = JsonNode.Parse(spec["llm"]!.ToJsonString());
-                    _selectedModel = StripProvider(AgentSpecProvider.DescribeModel(spec));
-                }
-                catch { }
-            }
-            await PopulateModelsAsync();
-            await RefreshAssumedContextWindowAsync();
-            RefreshStatsDisplay();
-            AddSystem("Settings saved.");
-        }
-        else
-        {
-            await PopulateModelsAsync();
-            await RefreshAssumedContextWindowAsync();
-            RefreshStatsDisplay();
-            AddSystem("Settings saved. Connection/model defaults apply after you Stop and Start again.");
-        }
-    }
 
     /// <summary>
     /// Fill the model dropdown from Ollama's installed list and refresh the capability
@@ -535,30 +522,6 @@ public partial class MainWindow : Window
         }
     }
 
-    /// <summary>
-    /// Open the Model Store (one-click install/remove of local models). Reuses the
-    /// shared OllamaClient so cache state stays consistent. If the installed set
-    /// changed, re-scan so the dropdown reflects additions/removals immediately.
-    /// </summary>
-    private async void OnModelStore(object sender, RoutedEventArgs e)
-        => await OpenModelStoreAsync();
-
-    /// <summary>
-    /// Open the Model Store. When <paramref name="autoInstall"/> is set, the store
-    /// starts downloading that model on open (used by the in-chat Install buttons so
-    /// the user never has to touch a command line). Refreshes the model dropdown if
-    /// anything was installed or removed.
-    /// </summary>
-    private async Task OpenModelStoreAsync(string? autoInstall = null)
-    {
-        if (_ollama is null) _ollama = new OllamaClient(_settings.OllamaUrl);
-
-        var dlg = new ModelStoreWindow(_ollama, autoInstall) { Owner = this };
-        dlg.ShowDialog();
-
-        if (dlg.ModelsChanged)
-            await PopulateModelsAsync();
-    }
 
     /// <summary>True for models that only do embeddings (no chat/completion).</summary>
     private static bool IsEmbeddingOnly(ModelInfo? info)
@@ -704,42 +667,42 @@ public partial class MainWindow : Window
             FontSize = 11,
             Margin = new Thickness(5, 0, 0, 0),
             VerticalAlignment = VerticalAlignment.Center,
-            Foreground = (Brush)FindResource(warn ? "Warn" : dim ? "TextDim" : "Text")
+            Foreground = (IBrush)this.FindResource(warn ? "Warn" : dim ? "TextDim" : "Text")!
         });
 
         var badge = new Border
         {
-            Background = (Brush)FindResource("PanelAlt"),
-            BorderBrush = (Brush)FindResource(warn ? "Warn" : "Border"),
+            Background = (IBrush)this.FindResource("PanelAlt")!,
+            BorderBrush = (IBrush)this.FindResource(warn ? "Warn" : "Border")!,
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(6),
             Padding = new Thickness(7, 2, 8, 2),
             Margin = new Thickness(0, 0, 6, 0),
-            Child = row,
-            ToolTip = tip
+            Child = row
         };
-        ToolTipService.SetInitialShowDelay(badge, 250);
-        ToolTipService.SetShowDuration(badge, 20000);
+        ToolTip.SetTip(badge, tip);
         return badge;
     }
 
     // ---- UI event handlers --------------------------------------------------
 
     /// <summary>Let the user choose the folder the agent will operate in.</summary>
-    private void OnPickWorkDir(object sender, RoutedEventArgs e)
+    private async void OnPickWorkDir(object sender, RoutedEventArgs e)
     {
-        var dlg = new OpenFolderDialog
+        var folders = await StorageProvider.OpenFolderPickerAsync(new Avalonia.Platform.Storage.FolderPickerOpenOptions
         {
             Title = "Choose working directory",
-            InitialDirectory = _workingDir
-        };
-        if (dlg.ShowDialog(this) == true)
+            SuggestedStartLocation = await StorageProvider.TryGetFolderFromPathAsync(new Uri(_workingDir))
+        });
+        if (folders.Count > 0)
         {
-            _workingDir = dlg.FolderName;
+            _workingDir = folders[0].Path.LocalPath;
             WorkDirButton.Content = ShortPath(_workingDir);
-            WorkDirButton.ToolTip = _workingDir;
-            _ = UpdateRepoBadgeAsync();
-            _ = RefreshTreeAsync();
+            ToolTip.SetTip(WorkDirButton, _workingDir);
+            if (_client is null)
+                await EnsureBackendInWorkingDirAsync();
+            await UpdateRepoBadgeAsync();
+            await RefreshTreeAsync();
         }
     }
 
@@ -751,19 +714,18 @@ public partial class MainWindow : Window
     /// If Git isn't installed, offer to send the user to the official download page.
     /// Git underpins the agent's version-control and GitHub features.
     /// </summary>
-    private void PromptInstallGitIfMissing()
+    private async void PromptInstallGitIfMissing()
     {
         if (GitService.GitAvailable) return;
 
-        var choice = MessageBox.Show(
+        var choice = await MessageBox.ShowAsync(
             this,
             "Git is not installed on this PC.\n\n"
             + "StayVibin uses Git for version control and GitHub features "
             + "(commits, branches, pull requests). Would you like to download and "
             + "install it now?\n\nAfter installing, restart StayVibin.",
             "Install Git?",
-            MessageBoxButton.YesNo,
-            MessageBoxImage.Question);
+            MessageBoxButton.YesNo);
 
         if (choice == MessageBoxResult.Yes)
             OpenUrl(GitDownloadUrl);
@@ -782,25 +744,29 @@ public partial class MainWindow : Window
     {
         if (!GitService.GitAvailable)
         {
-            RepoButton.Visibility = Visibility.Collapsed;
+            RepoButton.IsVisible = false;
             return;
         }
 
         var status = await GitService.GetStatusAsync(_workingDir);
         if (status is null)
         {
-            RepoButton.Visibility = Visibility.Collapsed;
+            RepoButton.IsVisible = false;
             return;
         }
 
+        // Sidebar icon button: show a branch glyph, tint it amber when the tree is
+        // dirty, and put the full branch/status detail in the tooltip.
+        RepoButton.Content = "\u2387";
+        RepoButton.Foreground = status.IsDirty ? (IBrush)this.FindResource("Warn")! : (IBrush)this.FindResource("TextDim")!;
+
         var dirtyMark = status.IsDirty ? " *" : "";
-        RepoButton.Content = $"git: {status.Branch}{dirtyMark}";
-        RepoButton.Foreground = status.IsDirty ? (Brush)FindResource("Warn") : (Brush)FindResource("TextDim");
-        RepoButton.ToolTip = (status.RepoSlug is null ? "" : $"{status.RepoSlug}\n")
-            + $"Branch: {status.Branch}\n"
+        var tip = (status.RepoSlug is null ? "" : $"{status.RepoSlug}\n")
+            + $"git: {status.Branch}{dirtyMark}\n"
             + (status.IsDirty ? $"{status.Dirty} uncommitted change(s)" : "Working tree clean")
             + "\n(click to refresh)";
-        RepoButton.Visibility = Visibility.Visible;
+        ToolTip.SetTip(RepoButton, tip);
+        RepoButton.IsVisible = true;
     }
 
     /// <summary>Log what git/GitHub tooling the agent has, once per session start.</summary>
@@ -840,15 +806,14 @@ public partial class MainWindow : Window
             return false;
         }
 
-        var choice = MessageBox.Show(
+        var choice = await MessageBox.ShowAsync(
             this,
             "StayVibin's AI engine isn't installed yet.\n\n"
             + "StayVibin can set it up for you automatically (it installs uv if needed, "
             + "then downloads the engine). This needs an internet connection and can "
             + "take a few minutes.\n\nInstall it now?",
             "Set up StayVibin's AI engine?",
-            MessageBoxButton.YesNo,
-            MessageBoxImage.Question);
+            MessageBoxButton.YesNo);
         if (choice != MessageBoxResult.Yes)
         {
             AddSystem("The AI engine is not installed. You can install it later by "
@@ -936,16 +901,23 @@ public partial class MainWindow : Window
                 return;
             }
 
-            JsonNode spec = await AgentSpecProvider.LoadAsync(_workingDir, _editorPath, planMode: _settings.PlanMode);
+            JsonNode spec = await AgentSpecProvider.LoadAsync(_workingDir, _editorPath, planMode: _settings.PlanMode, autoCompact: _settings.AutoCompact);
             _llmTemplate ??= JsonNode.Parse(spec["llm"]!.ToJsonString());
             if (_selectedModel is not null) ApplyModel(spec, _selectedModel);
 
             if (_settings.AutoTune)
                 await AutoTuneSpecAsync(spec);
             else
+            {
                 // AutoTune off still needs correct tool-calling mode, otherwise the
                 // saved spec's native_tool_calling=false breaks tool-capable models.
                 await ApplyNativeToolCallingAsync(spec);
+                // ...and it must still size the engine + token budget to the user's
+                // context setting. Without this a manual "Max context" entry never
+                // reaches the engine (it keeps the launch default) - the
+                // "doesn't take manual entries" symptom when AutoTune is off.
+                await ApplyRuntimeContextAsync(spec, _settings.BackendContextLength);
+            }
             if (_selectedModel is not null)
                 _ = ShowModelFitnessAdviceAsync(_selectedModel);
 
@@ -1045,7 +1017,10 @@ public partial class MainWindow : Window
 
     /// <summary>Show/hide the conversation-history rail (mirrors the Files toggle).</summary>
     private void OnToggleHistory(object sender, RoutedEventArgs e)
-        => HistoryCol.Width = HistoryCol.Width.Value > 0 ? new GridLength(0) : new GridLength(220);
+    {
+        HistoryPanel.IsVisible = !HistoryPanel.IsVisible;
+        HistorySplitter.IsVisible = HistoryPanel.IsVisible;
+    }
 
     /// <summary>
     /// Reload the conversation list from the server (most recent first) and
@@ -1061,6 +1036,7 @@ public partial class MainWindow : Window
         _conversations.Clear();
         foreach (var c in list)
         {
+            if (_hiddenConversationIds.Contains(c.Id)) continue;
             // Hide unused (empty) conversations, but always keep the active one so a
             // freshly created chat stays visible/highlighted until its first message.
             if (!c.HasUserMessage && c.Id != _activeConversationId) continue;
@@ -1118,11 +1094,12 @@ public partial class MainWindow : Window
             await DisposeClientAsync();
             ResetChatView();
 
-            var spec = await AgentSpecProvider.LoadAsync(_workingDir, _editorPath, planMode: _settings.PlanMode);
+            var spec = await AgentSpecProvider.LoadAsync(_workingDir, _editorPath, planMode: _settings.PlanMode, autoCompact: _settings.AutoCompact);
             if (_selectedModel is not null) ApplyModel(spec, _selectedModel);
             if (_settings.AutoTune) await AutoTuneSpecAsync(spec);
             else await ApplyNativeToolCallingAsync(spec);
 
+            await EnsureBackendInWorkingDirAsync();
             await ConnectConversationAsync(spec);
             AddSystem($"New conversation. Working in {_workingDir}");
         }
@@ -1172,7 +1149,7 @@ public partial class MainWindow : Window
             {
                 _workingDir = row.WorkingDir;
                 WorkDirButton.Content = ShortPath(_workingDir);
-                WorkDirButton.ToolTip = _workingDir;
+                ToolTip.SetTip(WorkDirButton, _workingDir);
                 _ = RefreshTreeAsync();
                 _ = UpdateRepoBadgeAsync();
             }
@@ -1201,6 +1178,14 @@ public partial class MainWindow : Window
             AddSystem($"Reopened conversation. Working in {_workingDir}");
             _ = WarmSelectedModelAsync();
         }
+        catch (AgentServerException ex) when (ex.IsNotFound)
+        {
+            HideConversationRow(row.Id);
+            SetStatus("Ready", AppDot.Idle);
+            AddSystem("That conversation is no longer available on the running agent-server, so it was removed from the list. Start a new chat to continue.");
+            await DisposeClientAsync();
+            SetSessionActive(false);
+        }
         catch (Exception ex)
         {
             SetStatus("Error", AppDot.Down);
@@ -1220,15 +1205,34 @@ public partial class MainWindow : Window
         if (sender is not Button btn || btn.Tag is not string id || string.IsNullOrEmpty(id))
             return;
 
-        var confirm = MessageBox.Show(this,
+        var confirm = await MessageBox.ShowAsync(this,
             "Delete this conversation permanently? This cannot be undone.",
-            "Delete conversation", MessageBoxButton.YesNo, MessageBoxImage.Warning);
+            "Delete conversation", MessageBoxButton.YesNo);
         if (confirm != MessageBoxResult.Yes) return;
 
-        var ok = await AgentServerClient.DeleteConversationAsync(_backend.BaseUrl, id);
-        if (!ok)
+        // If this is the active chat, stop the event stream first. A running/stuck
+        // conversation can reject DELETE until its socket/runtime is torn down.
+        if (id == _activeConversationId && _client is not null)
         {
-            AddError("Could not delete the conversation (the server rejected the request).");
+            await _client.InterruptAsync();
+            await DisposeClientAsync();
+        }
+
+        var result = await AgentServerClient.DeleteConversationDetailedAsync(_backend.BaseUrl, id);
+        if (!result.Succeeded)
+        {
+            HideConversationRow(id);
+            if (id == _activeConversationId)
+            {
+                ResetChatView();
+                _activeConversationId = null;
+                SetSessionActive(false);
+                SetStatus("Stopped", AppDot.Down);
+            }
+
+            AddSystem(result.IsNotFound
+                ? "That conversation was already gone on the server, so it was removed from the list."
+                : "The server rejected deleting that conversation, so it was hidden locally. Restarting the agent-server will clear any stuck runtime.");
             return;
         }
 
@@ -1243,6 +1247,16 @@ public partial class MainWindow : Window
             AddSystem("Conversation deleted.");
         }
         await RefreshConversationListAsync();
+    }
+
+    /// <summary>Hide a stale or stuck conversation row without deleting persisted files.</summary>
+    private void HideConversationRow(string id)
+    {
+        _hiddenConversationIds.Add(id);
+        var row = _conversations.FirstOrDefault(c => c.Id == id);
+        if (row is not null)
+            _conversations.Remove(row);
+        HighlightActiveConversation();
     }
 
     /// <summary>
@@ -1264,12 +1278,16 @@ public partial class MainWindow : Window
     private void ResetChatView()
     {
         _chat.Clear();
+        _activeThought = null;
         _streamingItem = null;
         _lastAgentItem = null;
         _streamRaw.Clear();
         _streamStripMode = false;
         _streamEnvelopeMode = false;
         _lastAssistantText = "";
+        // Fresh conversation: resume following and hide the jump button.
+        _autoScroll = true;
+        if (ScrollDownButton is not null) ScrollDownButton.IsVisible = false;
     }
 
     /// <summary>
@@ -1313,7 +1331,7 @@ public partial class MainWindow : Window
             await DisposeClientAsync();   // drop the stale conversation + its registry
             ResetChatView();              // the new conversation starts empty; clear the UI too
 
-            var spec = await AgentSpecProvider.LoadAsync(_workingDir, _editorPath, planMode: _settings.PlanMode);
+            var spec = await AgentSpecProvider.LoadAsync(_workingDir, _editorPath, planMode: _settings.PlanMode, autoCompact: _settings.AutoCompact);
             ApplyModel(spec, model);
             if (_settings.AutoTune) await AutoTuneSpecAsync(spec);
             else await ApplyNativeToolCallingAsync(spec);   // keep tool calling correct
@@ -1348,6 +1366,12 @@ public partial class MainWindow : Window
                 try { await _client.InterruptAsync(); } catch { }
             }
             await DisposeClientAsync();
+
+            // Stop only halts the agent and ends the conversation. The model stays
+            // resident (keep_alive=-1) so the next Start is instant; it is freed only
+            // when the user switches models (the engine evicts it) or shuts the engine
+            // down (the process is killed). This matches the desired behavior of a
+            // pause button that does not pay the cold-load cost on every restart.
             AddSystem("Session stopped. Press Start to begin a new one.");
         }
         finally
@@ -1365,23 +1389,9 @@ public partial class MainWindow : Window
 
     private async void OnInputKeyDown(object sender, KeyEventArgs e)
     {
-        // Ctrl+V with a screenshot/image on the clipboard -> attach it instead of
-        // pasting nothing. Text paste falls through to the textbox as usual.
-        if (e.Key == Key.V && (Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control
-            && AttachButton.IsEnabled && Clipboard.ContainsImage() && !Clipboard.ContainsText())
-        {
-            var img = Clipboard.GetImage();
-            if (img is not null)
-            {
-                StageClipboardImage(img);
-                e.Handled = true;
-                return;
-            }
-        }
-
         // Enter sends, or queues the message when the agent is busy; Shift+Enter =
         // newline. To interject immediately mid-task, use the Steer button.
-        if (e.Key == Key.Enter && (Keyboard.Modifiers & ModifierKeys.Shift) == 0)
+        if (e.Key == Key.Enter && (e.KeyModifiers & KeyModifiers.Shift) == 0)
         {
             e.Handled = true;
             await SendAsync();
@@ -1453,19 +1463,17 @@ public partial class MainWindow : Window
     private readonly List<Attachment> _attachments = new();
 
     /// <summary>Open a file picker and stage the chosen files as attachments.</summary>
-    private void OnAttachClick(object sender, RoutedEventArgs e)
+    private async void OnAttachClick(object sender, RoutedEventArgs e)
     {
-        var dlg = new OpenFileDialog
+        var files = await StorageProvider.OpenFilePickerAsync(new Avalonia.Platform.Storage.FilePickerOpenOptions
         {
             Title = "Attach files, images or video",
-            Multiselect = true,
-            Filter = "All supported|*.*|"
-                     + "Images|*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp|"
-                     + "Video|*.mp4;*.mov;*.mkv;*.avi;*.webm;*.m4v|"
-                     + "All files|*.*"
-        };
-        if (dlg.ShowDialog(this) != true) return;
-        StagePaths(dlg.FileNames);
+            AllowMultiple = true
+        });
+        if (files.Count > 0)
+        {
+            StagePaths(files.Select(f => f.Path.LocalPath));
+        }
     }
 
     private void StagePaths(IEnumerable<string> paths)
@@ -1487,7 +1495,7 @@ public partial class MainWindow : Window
 
     private void OnInputDragEnter(object sender, DragEventArgs e)
     {
-        e.Effects = AttachButton.IsEnabled && e.Data.GetDataPresent(DataFormats.FileDrop)
+        e.DragEffects = AttachButton.IsEnabled && e.DataTransfer.TryGetFiles() is { Length: > 0 }
             ? DragDropEffects.Copy
             : DragDropEffects.None;
         e.Handled = true;
@@ -1496,33 +1504,17 @@ public partial class MainWindow : Window
     private void OnInputDrop(object sender, DragEventArgs e)
     {
         if (!AttachButton.IsEnabled) return;
-        if (e.Data.GetData(DataFormats.FileDrop) is string[] files && files.Length > 0)
+        if (e.DataTransfer.TryGetFiles() is { } files)
         {
-            StagePaths(files);
-            e.Handled = true;
-        }
-    }
-
-    /// <summary>Save a pasted/clipboard image to a temp PNG and stage it.</summary>
-    private void StageClipboardImage(BitmapSource bmp)
-    {
-        try
-        {
-            var temp = System.IO.Path.Combine(
-                System.IO.Path.GetTempPath(),
-                $"screenshot-{DateTime.Now:yyyyMMdd-HHmmss}.png");
-            using (var fs = new System.IO.FileStream(temp, System.IO.FileMode.Create))
+            var paths = files
+                .OfType<Avalonia.Platform.Storage.IStorageFile>()
+                .Select(f => f.Path.LocalPath)
+                .ToArray();
+            if (paths.Length > 0)
             {
-                var encoder = new PngBitmapEncoder();
-                encoder.Frames.Add(BitmapFrame.Create(bmp));
-                encoder.Save(fs);
+                StagePaths(paths);
+                e.Handled = true;
             }
-            _attachments.Add(AttachmentService.Stage(temp, _workingDir));
-            RenderAttachChips();
-        }
-        catch (Exception ex)
-        {
-            AddError($"Could not paste image: {ex.Message}");
         }
     }
 
@@ -1538,10 +1530,10 @@ public partial class MainWindow : Window
         AttachPanel.Children.Clear();
         if (_attachments.Count == 0)
         {
-            AttachPanel.Visibility = Visibility.Collapsed;
+            AttachPanel.IsVisible = false;
             return;
         }
-        AttachPanel.Visibility = Visibility.Visible;
+        AttachPanel.IsVisible = true;
 
         foreach (var att in _attachments.ToList())
         {
@@ -1556,14 +1548,13 @@ public partial class MainWindow : Window
             row.Children.Add(new TextBlock
             {
                 Text = icon,
-                FontFamily = new FontFamily("Segoe UI Emoji"),
                 FontSize = 13,
                 VerticalAlignment = VerticalAlignment.Center
             });
             row.Children.Add(new TextBlock
             {
                 Text = att.FileName,
-                Foreground = (Brush)FindResource("Text"),
+                Foreground = (IBrush)this.FindResource("Text")!,
                 FontSize = 12,
                 Margin = new Thickness(5, 0, 6, 0),
                 VerticalAlignment = VerticalAlignment.Center
@@ -1571,30 +1562,32 @@ public partial class MainWindow : Window
 
             var remove = new Button
             {
-                Content = "\u2715",
-                Foreground = (Brush)FindResource("TextDim"),
-                Background = System.Windows.Media.Brushes.Transparent,
+                Content = "✕",
+                Foreground = (IBrush)this.FindResource("TextDim")!,
+                Background = Brushes.Transparent,
                 BorderThickness = new Thickness(0),
                 Padding = new Thickness(2, 0, 2, 0),
-                Cursor = System.Windows.Input.Cursors.Hand,
-                VerticalAlignment = VerticalAlignment.Center,
-                ToolTip = "Remove"
+                Cursor = new Cursor(StandardCursorType.Hand),
+                VerticalAlignment = VerticalAlignment.Center
             };
+            ToolTip.SetTip(remove, "Remove");
+            
             var captured = att;
             remove.Click += (_, _) => { _attachments.Remove(captured); RenderAttachChips(); };
             row.Children.Add(remove);
 
-            AttachPanel.Children.Add(new Border
+            var chip = new Border
             {
-                Background = (Brush)FindResource("PanelAlt"),
-                BorderBrush = (Brush)FindResource("Border"),
+                Background = (IBrush)this.FindResource("PanelAlt")!,
+                BorderBrush = (IBrush)this.FindResource("Border")!,
                 BorderThickness = new Thickness(1),
                 CornerRadius = new CornerRadius(6),
                 Padding = new Thickness(8, 3, 6, 3),
                 Margin = new Thickness(0, 0, 6, 6),
-                Child = row,
-                ToolTip = att.DestRelPath
-            });
+                Child = row
+            };
+            ToolTip.SetTip(chip, att.DestRelPath);
+            AttachPanel.Children.Add(chip);
         }
     }
 
@@ -1654,8 +1647,26 @@ public partial class MainWindow : Window
     private async Task<(TuneResult rec, ModelInfo? info)> RecommendAsync(string model)
     {
         ModelInfo? info = _ollama is null ? null : await _ollama.GetModelInfoAsync(model);
+
+        // VRAM-aware auto-fit: only when the user has NOT pinned an explicit context
+        // cap in Settings (their value always wins). We size the window so the model
+        // weights + KV cache stay resident in VRAM (GPU) or system RAM (CPU), which
+        // is what stops big models from saturating a too-large window and stalling.
+        int autoFit = 0;
+        if (_settings.ContextLength <= 0 && _ollama is not null)
+        {
+            long weightBytes = await _ollama.GetModelDiskSizeAsync(model);
+            // FitContextToMemory probes VRAM/RAM, which on first call spawns
+            // nvidia-smi / PowerShell and blocks for up to a few seconds. Run it off
+            // the UI thread so the start sequence never freezes the window. Results
+            // are cached for the app lifetime, so later calls are effectively free.
+            var device = _settings.ComputeDevice;
+            var kv = _settings.KvCacheType;
+            autoFit = await Task.Run(() => ModelTuning.FitContextToMemory(info, weightBytes, device, kv));
+        }
+
         // ContextLength is the user-set ceiling; AutoTune fits each model under it.
-        return (ModelTuning.Recommend(model, info, _settings.ContextLength), info);
+        return (ModelTuning.Recommend(model, info, _settings.ContextLength, autoFit), info);
     }
 
     /// <summary>
@@ -1671,15 +1682,25 @@ public partial class MainWindow : Window
         ApplyTuningToLlm(spec["llm"], rec);
         ApplyTuningToLlm(spec["condenser"]?["llm"], rec);
 
-        // The runtime window is what the meter should track. We do NOT overwrite
-        // _settings.ContextLength here - that is the user's ceiling, not the result.
-        _assumedContextWindow = rec.ContextLength;
+        // Resize the engine to the tuned window and apply the matching token budget
+        // (input cap + condenser trigger) so the agent compacts before the engine has
+        // to truncate, and so the meter tracks the real window.
+        await ApplyRuntimeContextAsync(spec, rec.ContextLength);
 
         var kind = ModelTuning.IsThinkingModel(model, info) ? "thinking"
             : model.Contains("coder", StringComparison.OrdinalIgnoreCase) ? "coder"
             : "chat";
+
+        // When auto-fitting (no explicit Settings cap), note what memory the context
+        // window was sized against so the user understands why it landed where it did.
+        var fitNote = "";
+        if (_settings.ContextLength <= 0)
+        {
+            var budget = HardwareInfo.DescribeBudget(_settings.ComputeDevice);
+            if (!string.IsNullOrEmpty(budget)) fitNote = $", fit to {budget}";
+        }
         AddSystem($"Auto-tuned {model} ({kind}): temperature {rec.Temperature:0.0}, "
-                  + $"context {rec.ContextLength:N0} tokens, reasoning {rec.ReasoningEffort}.");
+                  + $"context {rec.ContextLength:N0} tokens{fitNote}, reasoning {rec.ReasoningEffort}.");
     }
 
     /// <summary>
@@ -1707,12 +1728,98 @@ public partial class MainWindow : Window
         if (llm is JsonObject o) o["native_tool_calling"] = native;
     }
 
+    /// <summary>
+    /// Make the whole stack agree on one runtime context window: restart the engine
+    /// to <paramref name="window"/> if needed, point the meter at it, and apply the
+    /// matching token budget to the spec. Used by both the AutoTune and AutoTune-off
+    /// start paths so a manual "Max context" entry (or the auto-fit) always reaches
+    /// the engine and the agent.
+    /// </summary>
+    private async Task ApplyRuntimeContextAsync(JsonNode spec, int window)
+    {
+        if (window < ModelTuning.ContextFloor) window = ModelTuning.ContextFloor;
+        await EnsureEngineContextAsync(window);
+        // The runtime window is what the meter should track. We do NOT overwrite
+        // _settings.ContextLength here - that is the user's ceiling, not the result.
+        _assumedContextWindow = window;
+        ApplyContextBudget(spec, window);
+    }
+
+    /// <summary>
+    /// Relaunch the bundled engine so its fixed context window (OLLAMA_CONTEXT_LENGTH,
+    /// applied at process launch) matches <paramref name="window"/>. Without this a
+    /// reused engine keeps its previous size: the agent's requests then run at the
+    /// wrong window, the model reloads, and the meter "snaps back" to the launch
+    /// default. Guarded by _client is null so a mid-session model switch never kills a
+    /// live engine, and only acts on the bundled engine URL. Cheap at start time: no
+    /// model is loaded until the first inference, and health is re-awaited before the
+    /// session connects so the backend never talks to a dead port.
+    /// </summary>
+    private async Task EnsureEngineContextAsync(int window)
+    {
+        if (_client is null
+            && StayVibinEngineManager.IsDefaultEngineUrl(_settings.OllamaUrl)
+            && _engineContext != window)
+        {
+            SetStatus("Resizing engine context...", AppDot.Connecting);
+            RebuildEngineManager(window);
+            await _engine!.StartAsync(TimeSpan.FromSeconds(60));
+        }
+    }
+
+    /// <summary>
+    /// Size the agent's token budget to the fixed engine window so the engine never
+    /// has to truncate the prompt (the "truncating input prompt" / "context buffer
+    /// filled up" symptom). Two levers:
+    ///  - max_input_tokens = window minus an output reserve, so the input can never
+    ///    grow to fill the whole window and leave no room for the model's reply.
+    ///  - condenser max_tokens (token-aware auto-compaction) below the input budget,
+    ///    with headroom for one large tool observation, so history is summarized
+    ///    BEFORE the next prompt would exceed the budget. Without this the condenser
+    ///    only fires on event COUNT (max_size), which a few big tool outputs skip.
+    /// When auto-compaction is off we leave max_tokens null so nothing triggers
+    /// automatically (the user compacts manually via the context ring).
+    /// </summary>
+    private void ApplyContextBudget(JsonNode spec, int window)
+    {
+        // Reserve ~12% of the window (clamped 1-8k) for the model's reply.
+        int outputReserve = Math.Clamp(window / 8, 1024, 8192);
+        int inputBudget = Math.Max(window - outputReserve, ModelTuning.ContextFloor);
+
+        SetLlmInputBudget(spec["llm"], inputBudget);
+        SetLlmInputBudget(spec["condenser"]?["llm"], inputBudget);
+
+        if (spec["condenser"] is JsonObject cond)
+        {
+            if (_settings.AutoCompact)
+            {
+                // Compact at 80% of the input budget: enough headroom that a single
+                // large tool observation cannot push the next prompt past the budget
+                // before the condenser runs on the following step.
+                int trigger = (int)(inputBudget * 0.80);
+                if (trigger < ModelTuning.ContextFloor) trigger = ModelTuning.ContextFloor;
+                cond["max_tokens"] = trigger;
+            }
+            else
+            {
+                cond["max_tokens"] = null;
+            }
+        }
+    }
+
+    private static void SetLlmInputBudget(JsonNode? llm, int inputBudget)
+    {
+        if (llm is JsonObject o) o["max_input_tokens"] = inputBudget;
+    }
+
     private static void ApplyTuningToLlm(JsonNode? llm, TuneResult rec)
     {
         if (llm is not JsonObject o) return;
         o["temperature"] = rec.Temperature;
         o["reasoning_effort"] = rec.ReasoningEffort;
-        o["max_input_tokens"] = rec.ContextLength;
+        // NOTE: max_input_tokens is intentionally NOT set here. The runtime input
+        // budget (window minus an output reserve) is applied centrally in
+        // ApplyContextBudget so the engine always keeps room for the reply.
 
         // Use Ollama's real tool API when the model supports it. The prompt-text
         // fallback (native off) is what makes capable models leak '<function=...>'
@@ -1757,13 +1864,6 @@ public partial class MainWindow : Window
         }
     }
 
-    private void OnBodyMouseWheel(object sender, MouseWheelEventArgs e)
-    {
-        // Forward wheel events from the read-only message boxes to the chat scroller.
-        if (e.Handled) return;
-        e.Handled = true;
-        ChatScroll.ScrollToVerticalOffset(ChatScroll.VerticalOffset - e.Delta);
-    }
 
     // ---- agent stream handling ---------------------------------------------
 
@@ -1781,7 +1881,7 @@ public partial class MainWindow : Window
     /// </summary>
     private async Task SendAsync()
     {
-        var text = InputBox.Text.Trim();
+        var text = InputBox.Text?.Trim() ?? "";
         bool hasAttachments = _attachments.Count > 0;
         if ((text.Length == 0 && !hasAttachments) || _client is null || _busy) return;
 
@@ -1837,7 +1937,7 @@ public partial class MainWindow : Window
     /// </summary>
     private async Task SteerAsync()
     {
-        var text = InputBox.Text.Trim();
+        var text = InputBox.Text?.Trim() ?? "";
         bool hasAttachments = _attachments.Count > 0;
         if ((text.Length == 0 && !hasAttachments) || _client is null) return;
 
@@ -1897,9 +1997,6 @@ public partial class MainWindow : Window
     /// <summary>Show or hide the "N queued" indicator next to the input buttons.</summary>
     private void UpdateQueueIndicator()
     {
-        int n = _queue.Count;
-        QueueText.Text = n == 0 ? "" : n == 1 ? "1 queued" : $"{n} queued";
-        QueueText.Visibility = n == 0 ? Visibility.Collapsed : Visibility.Visible;
     }
 
     /// <summary>
@@ -1931,7 +2028,7 @@ public partial class MainWindow : Window
     }
 
     private void OnAgentUpdate(AgentUpdate u)
-        => Dispatcher.Invoke(() => ApplyUpdate(u));
+        => Dispatcher.UIThread.Post(() => ApplyUpdate(u));
 
     private void ApplyUpdate(AgentUpdate u)
     {
@@ -2123,7 +2220,7 @@ public partial class MainWindow : Window
     }
 
     private void OnServerStatus(string status)
-        => Dispatcher.Invoke(() =>
+        => Dispatcher.UIThread.Post(() =>
         {
             var s = status.ToLowerInvariant();
             bool running = s.Contains("running");
@@ -2140,7 +2237,7 @@ public partial class MainWindow : Window
             else if (!running)
             {
                 SetStatus(Capitalize(status), AppDot.Idle);
-                if (falling)
+                if (falling && !_permissionAwaitingApproval)
                 {
                     _ = HandleTurnFinishedAsync();
                 }
@@ -2170,7 +2267,7 @@ public partial class MainWindow : Window
 
         // A plan awaiting approval takes priority: show the Approve bar and stop
         // here (do not auto-continue or flush the queue while we wait on the user).
-        if (TryEnterPlanApproval())
+        if (_permissionAwaitingApproval || TryEnterPlanApproval())
             return;
 
         if (ShouldAutoContinueWork())
@@ -2209,7 +2306,7 @@ public partial class MainWindow : Window
         => text.Replace(AgentSpecProvider.PlanReadyMarker, "", StringComparison.Ordinal).TrimEnd();
 
     private void SetPlanApprovalVisible(bool visible)
-        => PlanApprovalBar.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+        => PlanApprovalBar.IsVisible = visible;
 
     private static AgentPermissionPolicy ToAgentPermissionPolicy(PermissionMode mode)
         => mode == PermissionMode.AllowAll
@@ -2223,13 +2320,13 @@ public partial class MainWindow : Window
         PermissionText.Text =
             "The agent wants to perform an action StayVibin marked as risky or unknown. "
             + "Review the last tool/action above, then allow it once, deny it, or switch to Allow all.";
-        PermissionApprovalBar.Visibility = Visibility.Visible;
+        PermissionApprovalBar.IsVisible = true;
     }
 
     private void ClearPermissionApproval()
     {
         _permissionAwaitingApproval = false;
-        PermissionApprovalBar.Visibility = Visibility.Collapsed;
+        PermissionApprovalBar.IsVisible = false;
     }
 
     private async void OnPermissionModeChanged(object sender, SelectionChangedEventArgs e)
@@ -2385,7 +2482,7 @@ public partial class MainWindow : Window
             : _streamingItem?.Text ?? "").Trim();
         if (text.Length == 0) return false;
 
-        return LooksLikeStoppedPromise(text);
+        return LooksLikeStoppedPromise(text) || LooksLikeUnevidencedCodeAnswer(text);
     }
 
     /// <summary>
@@ -2422,19 +2519,59 @@ public partial class MainWindow : Window
         return promises.Any(p => s.Contains(p, StringComparison.Ordinal));
     }
 
+    /// <summary>
+    /// Heuristic for a factual/code answer that sounds confident but does not mention
+    /// any repository evidence. This catches the common weak-model failure mode where
+    /// the assistant answers from priors after too little reading. We only use it
+    /// when no tools ran this turn, so a real evidence-based answer is never retried.
+    /// </summary>
+    private static bool LooksLikeUnevidencedCodeAnswer(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return false;
+        var s = text.Trim();
+        var lower = s.ToLowerInvariant();
+
+        bool mentionsEvidence =
+            lower.Contains(".cs") || lower.Contains(".cpp") || lower.Contains(".h")
+            || lower.Contains(".xaml") || lower.Contains(".py") || lower.Contains("src\\")
+            || lower.Contains("services\\") || lower.Contains("models\\")
+            || lower.Contains("lines ") || lower.Contains("line ")
+            || lower.Contains("i searched") || lower.Contains("i read")
+            || lower.Contains("based on") || lower.Contains("in `") || lower.Contains("path:");
+
+        bool makesCodeClaims =
+            lower.Contains("issue") || lower.Contains("bug") || lower.Contains("uses ")
+            || lower.Contains("netcode") || lower.Contains("function")
+            || lower.Contains("method") || lower.Contains("class")
+            || lower.Contains("cvar") || lower.Contains("spawn")
+            || lower.Contains("answer") || lower.Contains("there isn't")
+            || lower.Contains("there is no") || lower.Contains("the problem");
+
+        return makesCodeClaims && !mentionsEvidence;
+    }
+
     private async Task AutoContinueWorkAsync()
     {
         if (_client is null) return;
 
         _turnAutoNudged = true;
-        AddSystem("The assistant stopped after saying it would work, so StayVibin is continuing the turn automatically.");
+        var text = (_lastAssistantText.Length > 0
+            ? _lastAssistantText
+            : _streamingItem?.Text ?? "").Trim();
+        bool needsEvidence = LooksLikeUnevidencedCodeAnswer(text);
+        AddSystem(needsEvidence
+            ? "The assistant answered without showing enough repository evidence, so StayVibin is asking it to verify the answer with tools."
+            : "The assistant stopped after saying it would work, so StayVibin is continuing the turn automatically.");
         SetRunning(true);
         try
         {
-            const string nudge =
-                "Continue now and actually perform the work with your tools. Do not describe a plan "
-                + "or ask me what to focus on. Start by inspecting the repository, running commands, "
-                + "and reporting concrete findings from real files.";
+            var nudge = needsEvidence
+                ? "Verify your answer with tools before replying. Search and read the repository now, "
+                    + "then answer with concrete findings grounded in real files and paths. Do not rely "
+                    + "on prior knowledge or general advice."
+                : "Continue now and actually perform the work with your tools. Do not describe a plan "
+                    + "or ask me what to focus on. Start by inspecting the repository, running commands, "
+                    + "and reporting concrete findings from real files.";
             await _client.SendUserMessageAsync(nudge);
         }
         catch (Exception ex)
@@ -2446,7 +2583,7 @@ public partial class MainWindow : Window
     }
 
     private void OnDisconnected(string reason)
-        => Dispatcher.Invoke(() =>
+        => Dispatcher.UIThread.Post(() =>
         {
             AddSystem($"Disconnected: {reason}");
             SetRunning(false);
@@ -2467,7 +2604,7 @@ public partial class MainWindow : Window
     private UsageStats? _lastStats;
 
     private void OnStats(UsageStats s)
-        => Dispatcher.Invoke(() =>
+        => Dispatcher.UIThread.Post(() =>
         {
             _lastStats = s;
             RefreshStatsDisplay();
@@ -2503,13 +2640,17 @@ public partial class MainWindow : Window
     {
         var stats = _lastStats;
         var window = _assumedContextWindow;
-        var used = stats?.PerTurnTokens ?? 0;
+        // Prefer the live per-turn count from the engine (updates token-by-token);
+        // fall back to the websocket snapshot when no turn is active.
+        var used = _liveTurnTokens ?? stats?.PerTurnTokens ?? 0;
         var pct = window > 0 ? Math.Clamp(100.0 * used / window, 0, 100) : 0;
 
-        ContextBar.Value = pct;
-        ContextBar.Foreground = pct >= 90 ? (Brush)FindResource("Err")
-            : pct >= 75 ? (Brush)FindResource("Warn")
-            : (Brush)FindResource("Accent");
+        // Drive the Cursor-style ring: sweep 0..360 degrees with usage and tint it
+        // amber/red as it nears the limit. The numeric readout sits beside it.
+        ContextArc.SweepAngle = pct * 3.6;
+        ContextArc.Stroke = pct >= 90 ? (IBrush)this.FindResource("Err")!
+            : pct >= 75 ? (IBrush)this.FindResource("Warn")!
+            : (IBrush)this.FindResource("Accent")!;
         ContextText.Text = $"{Human(used)} / {Human(window)} ({pct:0}%)";
 
         TokensText.Text = $"Tokens: {Human(stats?.TotalTokens ?? 0)}";
@@ -2517,14 +2658,14 @@ public partial class MainWindow : Window
     }
 
     private void OnCompactingStarted()
-        => Dispatcher.Invoke(() =>
+        => Dispatcher.UIThread.Post(() =>
         {
             AddSystem("Auto-compacting conversation history...");
             SetCompactStatus("Compacting...", AppDot.Working);
         });
 
     private void OnCompacted()
-        => Dispatcher.Invoke(() =>
+        => Dispatcher.UIThread.Post(() =>
         {
             AddSystem("Context auto-compacted (history summarized to free up space).");
             SetCompactStatus("Compacted", AppDot.Idle);
@@ -2532,41 +2673,56 @@ public partial class MainWindow : Window
         });
 
     /// <summary>Human-readable auto-compact status for the chat log at session start.</summary>
-    private static string DescribeAutoCompact(JsonNode spec)
+    private string DescribeAutoCompact(JsonNode spec)
     {
-        if (spec["condenser"] is not JsonObject cond)
-            return "Auto-compact is off (no condenser configured in agent settings).";
+        if (!_settings.AutoCompact || spec["condenser"] is not JsonObject cond)
+            return "Auto-compact is off - click the context ring to compact manually.";
 
         var max = cond["max_size"]?.GetValue<int>() ?? 280;
+        if (max >= AgentSpecProvider.AutoCompactDisabledSize)
+            return "Auto-compact is off - click the context ring to compact manually.";
+
         return $"Auto-compact is on - conversation history will be summarized automatically "
-               + $"when it grows past about {max} events. Use Compact now to summarize early.";
+               + $"when it grows past about {max} events. Click the context ring to summarize early.";
     }
 
+    /// <summary>
+    /// Transient compaction feedback. The dedicated strip label was removed, so we
+    /// surface status on the context ring's tooltip instead.
+    /// </summary>
     private void SetCompactStatus(string label, AppDot dot)
-    {
-        CompactText.Text = label;
-        CompactText.Foreground = dot switch
-        {
-            AppDot.Working => (Brush)FindResource("Warn"),
-            AppDot.Idle => (Brush)FindResource("Ok"),
-            _ => (Brush)FindResource("TextDim")
-        };
-    }
+        => ToolTip.SetTip(ContextButton, label);
+
+    private const string ContextRingTip =
+        "Context usage - click to compact (summarize) the conversation now";
 
     private async Task ResetCompactLabelAsync()
     {
         await Task.Delay(2500);
         if (_client is not null)
-            SetCompactStatus("Auto-compact: on", AppDot.Idle);
+            ToolTip.SetTip(ContextButton, ContextRingTip);
     }
 
     // ---- chat helpers -------------------------------------------------------
 
     private const int MaxChatItems = 600;
 
+    // The reasoning block currently showing the animated "Assistant is thinking..."
+    // header. Only the latest one animates; any new output settles it to "Thought".
+    private ChatItem? _activeThought;
+
     private ChatItem AddItem(ChatRole role, string header, string text)
     {
+        // Any new line means the previous reasoning block is no longer "in progress",
+        // so stop its animated header before adding the new item.
+        StopThinkingAnimation();
+
         var item = new ChatItem { Role = role, Header = header, Text = text };
+        if (role == ChatRole.Thought)
+        {
+            item.IsThinking = true;
+            _activeThought = item;
+        }
         _chat.Add(item);
         // Trim oldest lines so marathon sessions do not grow the collection without bound.
         if (_chat.Count > MaxChatItems)
@@ -2579,26 +2735,305 @@ public partial class MainWindow : Window
         return item;
     }
 
-    private void AddUser(string text) => AddItem(ChatRole.User, "You", text);
+    /// <summary>Settle the active reasoning block from "thinking..." to a static "Thought".</summary>
+    private void StopThinkingAnimation()
+    {
+        if (_activeThought is null) return;
+        _activeThought.IsThinking = false;
+        _activeThought = null;
+    }
+
+    private void AddUser(string text)
+    {
+        // Sending a message always snaps the view back to the conversation tail.
+        _autoScroll = true;
+        AddItem(ChatRole.User, "You", text);
+    }
     private void AddSystem(string text) => AddItem(ChatRole.System, "", text);
     private void AddError(string text) => AddItem(ChatRole.Error, "Error", text);
 
-    private void ScrollToBottom() => ChatScroll.ScrollToEnd();
+    // True while the chat should follow new content (the user is parked at the
+    // bottom). A user scrolling up clears it; returning to the bottom (or clicking
+    // the jump button) sets it again. Mirrors DC6's chat behavior.
+    private bool _autoScroll = true;
+
+    // Pixel slack for "close enough to the bottom" so sub-pixel layout rounding or a
+    // partially visible last line still counts as being at the bottom. Generous (matches
+    // DC6) so "follow latest" stays on while the user is near the tail.
+    private const double BottomSlack = 56;
+
+    private bool _scrollReposted;
+
+    /// <summary>
+    /// Scroll the chat to the newest message while auto-following. The critical detail
+    /// (mirrors DC6's TrimChatAndScrollToEnd): a streamed/added bubble has only had its
+    /// text set - its new size is NOT measured yet, so a bare ScrollToEnd() targets the
+    /// STALE extent and stops short, leaving the tail clipped under the input strip.
+    /// Forcing UpdateLayout() first finishes the pending measure/arrange so ScrollToEnd
+    /// reaches the TRUE bottom. UpdateLayout is deferred into a single coalesced Render
+    /// post so rapid streaming tokens don't each trigger a synchronous layout.
+    /// </summary>
+    private void ScrollToBottom()
+    {
+        if (!_autoScroll) return;
+
+        // Immediate best-effort so following feels responsive (may use pre-layout extent).
+        ChatScroll.ScrollToEnd();
+
+        // Coalesce the authoritative corrections: at most one pending chain at a time.
+        if (_scrollReposted) return;
+        _scrollReposted = true;
+        Dispatcher.UIThread.Post(() =>
+        {
+            if (!_autoScroll)
+            {
+                _scrollReposted = false;
+                return;
+            }
+            ChatScroll.UpdateLayout();   // finish pending layout -> real content extent
+            ChatScroll.ScrollToEnd();    // now scroll to the actual end
+
+            // Some controls (wrapping TextBox, newly visible banners/log panel) can
+            // settle one dispatcher tick after Render. One final low-priority pass keeps
+            // the last bubble above the dock without tying scrolling to LayoutUpdated.
+            Dispatcher.UIThread.Post(() =>
+            {
+                _scrollReposted = false;
+                if (!_autoScroll) return;
+                ChatScroll.UpdateLayout();
+                ChatScroll.ScrollToEnd();
+            }, DispatcherPriority.Background);
+        }, DispatcherPriority.Render);
+    }
+
+    /// <summary>True when the chat scroll offset is at (or within slack of) the end.</summary>
+    private bool IsChatAtBottom()
+        => ChatScroll.Offset.Y >= ChatScroll.Extent.Height - ChatScroll.Viewport.Height - BottomSlack;
+
+    /// <summary>
+    /// Detect when the user scrolls away from the bottom to disable following, and
+    /// toggle the floating jump button. While following, the button stays hidden.
+    /// </summary>
+    private void OnChatScrollChanged(object? sender, ScrollChangedEventArgs e)
+    {
+        bool atBottom = IsChatAtBottom();
+
+        // Decide whether to keep following. Order matters:
+        //   1. At the bottom -> follow (covers reaching the end by any means).
+        //   2. Otherwise, treat it as the user scrolling away ONLY when the offset
+        //      moved upward on its OWN - i.e. the extent and viewport did not change.
+        //
+        // This guard is the critical fix: the streamed bubble's text is frequently
+        // REPLACED with shorter text (markup/reasoning is stripped live, and the final
+        // message swaps the draft for the authoritative answer). Shorter content shrinks
+        // the extent, so the ScrollViewer clamps the offset DOWN and reports a negative
+        // OffsetDelta. Without the ExtentDelta/ViewportDelta guard that clamp looked
+        // exactly like a user scroll-up, which switched auto-follow OFF for the rest of
+        // the turn and left every later line clipped under the input strip. A genuine
+        // wheel/drag changes only the offset, so it still disables following correctly.
+        if (atBottom)
+            _autoScroll = true;
+        else if (e.OffsetDelta.Y < 0 && e.ExtentDelta.Y == 0 && e.ViewportDelta.Y == 0)
+            _autoScroll = false;
+
+        if (ScrollDownButton is not null)
+            ScrollDownButton.IsVisible = !_autoScroll && !atBottom;
+    }
+
+    /// <summary>Jump back to the latest message and resume auto-following.</summary>
+    private void OnScrollDownClick(object? sender, RoutedEventArgs e)
+    {
+        _autoScroll = true;
+        ChatScroll.ScrollToEnd();
+        ScrollDownButton.IsVisible = false;
+    }
 
     // Keep the in-memory log view bounded so long sessions don't grow it without
     // limit (the full log is still persisted to disk by BackendManager).
     private const int MaxLogChars = 120_000;
 
     private void OnBackendLog(string line)
-        => Dispatcher.Invoke(() =>
+        => Dispatcher.UIThread.Post(() =>
         {
-            LogBox.AppendText(line + Environment.NewLine);
+            LogBox.Text += line + Environment.NewLine;
             if (LogBox.Text.Length > MaxLogChars)
                 LogBox.Text = LogBox.Text[^(MaxLogChars / 2)..];
-            LogBox.ScrollToEnd();
+            LogBox.CaretIndex = LogBox.Text.Length;
 
             DetectStuckLoop(line);
+            TryUpdatePrefill(line);
+            TryUpdateLiveStats(line);
         });
+
+    // Matches the engine's prompt-processing (prefill) progress lines, e.g.:
+    //   "slot ... prompt processing, n_tokens = 6144, progress = 0.25, t = ..."
+    // progress is the fraction (0..1) of the whole prompt read into the model
+    // before generation starts. On big contexts this phase can take minutes.
+    private static readonly Regex PrefillProgressRegex = new(
+        @"prompt processing.*progress\s*=\s*([0-9]*\.?[0-9]+)",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    // One-shot auto-hide: if no new progress line arrives within this window, the
+    // prefill phase is done (generation started, finished, or errored), so hide the
+    // bar. Each progress line restarts the timer. Avoids needing a dedicated "done"
+    // signal that the engine does not always emit on the same line.
+    private DispatcherTimer? _prefillHideTimer;
+
+    /// <summary>
+    /// Parse an engine log line for prompt-processing (prefill) progress and drive
+    /// the small progress bar next to the token counter. Cheap no-op for the vast
+    /// majority of lines that are not progress reports.
+    /// </summary>
+    private void TryUpdatePrefill(string line)
+    {
+        // Fast reject before the regex to keep the common path allocation-free.
+        if (line.IndexOf("prompt processing", StringComparison.OrdinalIgnoreCase) < 0)
+            return;
+
+        var m = PrefillProgressRegex.Match(line);
+        if (!m.Success
+            || !double.TryParse(m.Groups[1].Value,
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var frac))
+            return;
+
+        var pct = Math.Clamp(frac, 0, 1) * 100.0;
+        PrefillBar.Value = pct;
+        PrefillText.Text = $"{pct:0}%";
+        PrefillPanel.IsVisible = true;
+
+        // (Re)arm the auto-hide. When prefill finishes there is no more progress
+        // chatter, so the timer fires and clears the bar.
+        _prefillHideTimer ??= CreatePrefillHideTimer();
+        _prefillHideTimer.Stop();
+        _prefillHideTimer.Start();
+    }
+
+    private DispatcherTimer CreatePrefillHideTimer()
+    {
+        var t = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
+        t.Tick += (_, _) => HidePrefillProgress();
+        return t;
+    }
+
+    /// <summary>Hide and reset the prefill progress bar (turn end / phase done).</summary>
+    private void HidePrefillProgress()
+    {
+        _prefillHideTimer?.Stop();
+        if (PrefillPanel is null) return;
+        PrefillPanel.IsVisible = false;
+        PrefillBar.Value = 0;
+        PrefillText.Text = "0%";
+    }
+
+    // ---- Live engine telemetry (single-line, reliable engine log fields) --------
+    //
+    // The agent-server only reports token/context usage to the GUI meter via its
+    // websocket stats event, which can lag a turn. The engine, however, prints
+    // precise single-line numbers as it works, and those lines already flow through
+    // OnBackendLog. We parse them to drive the context ring and a live generation
+    // readout in real time, so the GUI reflects what the user already sees in the
+    // log. Websocket stats (_lastStats) still refine the totals afterwards.
+
+    // "slot ... new prompt, n_ctx_slot = 32768, n_keep = 4, task.n_tokens = 140"
+    private static readonly Regex NewPromptRegex = new(
+        @"new prompt.*?task\.n_tokens\s*=\s*(\d+)",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    // "n_ctx_slot = 32768" - the engine's real runtime context window.
+    private static readonly Regex CtxSlotRegex = new(
+        @"n_ctx_slot\s*=\s*(\d+)",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    // "slot print_timing: ... n_decoded = 192, tg = 37.16 t/s" - generated tokens
+    // so far this turn and the current decode speed.
+    private static readonly Regex DecodeRegex = new(
+        @"n_decoded\s*=\s*(\d+).*?tg\s*=\s*([0-9]*\.?[0-9]+)",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    // Live per-turn token count derived from the engine (prompt + generated). When
+    // set it takes precedence over the websocket snapshot so the ring moves live.
+    private long? _liveTurnTokens;
+    // Prompt (prefill) size of the active turn; generated tokens are added to it.
+    private long _turnPromptTokens;
+    // Auto-hide for the generation readout once decode chatter stops.
+    private DispatcherTimer? _genHideTimer;
+
+    /// <summary>
+    /// Parse a single engine log line for live context/generation numbers and update
+    /// the meter and the generation readout. Cheap fast-rejects keep the common
+    /// (non-matching) line allocation-free.
+    /// </summary>
+    private void TryUpdateLiveStats(string line)
+    {
+        // True runtime context window straight from the engine slot.
+        if (line.IndexOf("n_ctx_slot", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            var cm = CtxSlotRegex.Match(line);
+            if (cm.Success && long.TryParse(cm.Groups[1].Value, out var ctx) && ctx > 0
+                && ctx != _assumedContextWindow)
+            {
+                _assumedContextWindow = ctx;
+                RefreshStatsDisplay();
+            }
+        }
+
+        // New turn: capture the prompt size and start the live count there.
+        if (line.IndexOf("new prompt", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            var pm = NewPromptRegex.Match(line);
+            if (pm.Success && long.TryParse(pm.Groups[1].Value, out var prompt))
+            {
+                _turnPromptTokens = prompt;
+                _liveTurnTokens = prompt;
+                RefreshStatsDisplay();
+            }
+            return;
+        }
+
+        // Generation progress: tokens decoded so far + current speed.
+        if (line.IndexOf("n_decoded", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            var dm = DecodeRegex.Match(line);
+            if (dm.Success
+                && long.TryParse(dm.Groups[1].Value, out var decoded)
+                && double.TryParse(dm.Groups[2].Value,
+                    System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out var tps))
+            {
+                _liveTurnTokens = _turnPromptTokens + decoded;
+                GenText.Text = $"{decoded} tok @ {tps:0.0} t/s";
+                GenText.IsVisible = true;
+                RefreshStatsDisplay();
+
+                _genHideTimer ??= CreateGenHideTimer();
+                _genHideTimer.Stop();
+                _genHideTimer.Start();
+            }
+            return;
+        }
+
+        // Turn finished: stop the live speed readout (keep the ring where it landed;
+        // the websocket stats event will reconcile the final totals).
+        if (line.IndexOf("stop processing", StringComparison.OrdinalIgnoreCase) >= 0)
+            HideGenStats();
+    }
+
+    private DispatcherTimer CreateGenHideTimer()
+    {
+        var t = new DispatcherTimer { Interval = TimeSpan.FromSeconds(4) };
+        t.Tick += (_, _) => HideGenStats();
+        return t;
+    }
+
+    /// <summary>Hide the live generation readout (decode finished / went quiet).</summary>
+    private void HideGenStats()
+    {
+        _genHideTimer?.Stop();
+        if (GenText is null) return;
+        GenText.IsVisible = false;
+        GenText.Text = "";
+    }
 
     // Set once per turn so the "got stuck" explanation is shown at most once even
     // though the backend emits several related warning lines. Reset on each new turn.
@@ -2628,30 +3063,64 @@ public partial class MainWindow : Window
             + "in the Model Store. You can also just press Send again to retry.");
     }
 
-    // Height the bottom dock takes when the server log is expanded (remembered so
-    // re-expanding restores whatever the user last dragged it to).
-    private GridLength _logExpandedHeight = new(220);
-
-    /// <summary>Expand the server log: give the bottom dock a resizable height.</summary>
-    private void OnServerLogExpanded(object sender, RoutedEventArgs e)
+    /// <summary>Toggle the collapsible server log from the sidebar Log button.</summary>
+    private void OnToggleLog(object sender, RoutedEventArgs e)
     {
-        BottomDockRow.Height = _logExpandedHeight;
-        BottomDockRow.MinHeight = 110;
-        BottomSplitter.Visibility = Visibility.Visible;
+        var show = !LogPanel.IsVisible;
+        LogPanel.IsVisible = show;
+        // Reflect the open/closed state on the sidebar button.
+        if (show) LogButton.Classes.Add("active");
+        else LogButton.Classes.Remove("active");
+    }
+
+    // ---- window state -------------------------------------------------------
+
+    /// <summary>
+    /// React to maximize/restore (and the size/position changes that come with it) so
+    /// we can keep the docked input strip on screen.
+    /// </summary>
+    protected override void OnPropertyChanged(AvaloniaPropertyChangedEventArgs change)
+    {
+        base.OnPropertyChanged(change);
+        if (change.Property == WindowStateProperty
+            || change.Property == OffScreenMarginProperty
+            || change.Property == BoundsProperty)
+            UpdateMaximizeInset();
     }
 
     /// <summary>
-    /// Collapse the server log: shrink the bottom dock to fit just the input row and
-    /// the collapsed log header, so there is no empty gap at the window bottom.
+    /// Keep the bottom input strip (message box, Send/Stop) on screen when maximized.
+    /// When maximized the window can extend past the visible work area - by the OS
+    /// resize-border overflow, and on some setups far enough that the docked strip
+    /// lands behind the taskbar. Measure the real overflow of the window frame below
+    /// the screen's work area and inset the root content by that much; the inset is
+    /// zero in the normal/restored state. We over-correct slightly (frame vs client
+    /// bottom) which only adds a few invisible pixels of off-screen margin.
     /// </summary>
-    private void OnServerLogCollapsed(object sender, RoutedEventArgs e)
+    private void UpdateMaximizeInset()
     {
-        // Remember the dragged size so the next expand restores it.
-        if (BottomDockRow.Height.IsAbsolute && BottomDockRow.Height.Value > 0)
-            _logExpandedHeight = BottomDockRow.Height;
-        BottomDockRow.Height = GridLength.Auto;
-        BottomDockRow.MinHeight = 0;
-        BottomSplitter.Visibility = Visibility.Collapsed;
+        if (WindowState is not (WindowState.Maximized or WindowState.FullScreen))
+        {
+            RootGrid.Margin = default;
+            return;
+        }
+
+        // Start from Avalonia's reported off-screen margin (the resize-border overflow).
+        double bottomInset = OffScreenMargin.Bottom;
+
+        // Then measure the frame's actual overflow below the work area, which also
+        // captures the case where the maximized window covers the taskbar.
+        var screen = Screens.ScreenFromWindow(this);
+        if (screen is not null && FrameSize is { } frame)
+        {
+            double scaling = screen.Scaling > 0 ? screen.Scaling : RenderScaling;
+            double frameBottomPx = Position.Y + frame.Height * scaling;
+            double workBottomPx = screen.WorkingArea.Y + screen.WorkingArea.Height;
+            double overflowDip = (frameBottomPx - workBottomPx) / scaling;
+            if (overflowDip > bottomInset) bottomInset = overflowDip;
+        }
+
+        RootGrid.Margin = new Thickness(0, 0, 0, Math.Max(0, bottomInset));
     }
 
     // ---- status / state -----------------------------------------------------
@@ -2661,13 +3130,6 @@ public partial class MainWindow : Window
     private void SetStatus(string text, AppDot dot)
     {
         StatusText.Text = text;
-        StatusDot.Fill = dot switch
-        {
-            AppDot.Idle => (Brush)FindResource("Ok"),
-            AppDot.Working => (Brush)FindResource("Warn"),
-            AppDot.Connecting => (Brush)FindResource("Warn"),
-            _ => (Brush)FindResource("Err"),
-        };
     }
 
     private void SetBusy(bool busy)
@@ -2685,22 +3147,24 @@ public partial class MainWindow : Window
         if (active)
         {
             StartButtonText.Text = "Stop";
-            StartButton.Style = (Style)FindResource("DangerButton");
+            StartButton.Classes.Remove("accent");
+            StartButton.Classes.Add("danger");
             StartButton.IsEnabled = true;
             WorkDirButton.IsEnabled = false;
             InputBox.IsEnabled = true;
-            CompactButton.IsEnabled = true;
+            ContextButton.IsEnabled = true;
             AttachButton.IsEnabled = true;
             SetRunning(false);
         }
         else
         {
             StartButtonText.Text = "Start";
-            StartButton.Style = (Style)FindResource("AccentButton");
+            StartButton.Classes.Remove("danger");
+            StartButton.Classes.Add("accent");
             StartButton.IsEnabled = true;
             WorkDirButton.IsEnabled = true;
             InputBox.IsEnabled = false;
-            CompactButton.IsEnabled = false;
+            ContextButton.IsEnabled = false;
             AttachButton.IsEnabled = false;
             InterruptButton.IsEnabled = false;
             SteerButton.IsEnabled = false;
@@ -2721,6 +3185,8 @@ public partial class MainWindow : Window
     private void SetRunning(bool running)
     {
         _agentRunning = running;
+        // When the agent stops working, a trailing reasoning block is done thinking.
+        if (!running) StopThinkingAnimation();
         bool session = _client is not null;
         InterruptButton.IsEnabled = running;     // "Stop" - halts the current task
         SteerButton.IsEnabled = running;         // interject immediately
@@ -2744,32 +3210,28 @@ public partial class MainWindow : Window
         if (on == _activityOn) return;
         _activityOn = on;
 
-        var spin = (Storyboard)Resources["ButtonSpinSb"];
-        var pulse = (Storyboard)Resources["DotPulseSb"];
         if (on)
         {
-            ButtonSpinner.Visibility = Visibility.Visible;
-            spin.Begin(this, true);
-            pulse.Begin(this, true);
+            ButtonSpinner.IsVisible = true;
         }
         else
         {
-            spin.Stop(this);
-            pulse.Stop(this);
-            ButtonSpinner.Visibility = Visibility.Collapsed;
-            StatusDot.Opacity = 1.0;   // restore after the pulse leaves it dimmed
+            ButtonSpinner.IsVisible = false;
         }
     }
 
     private void ResetStatsDisplay()
     {
         _lastStats = null;
-        ContextBar.Value = 0;
+        _liveTurnTokens = null;
+        _turnPromptTokens = 0;
+        ContextArc.SweepAngle = 0;
         ContextText.Text = "-- / --";
         TokensText.Text = "Tokens: 0";
         CostText.Text = "";
-        CompactText.Text = "Auto-compact: on";
-        CompactText.Foreground = (Brush)FindResource("Ok");
+        ToolTip.SetTip(ContextButton, ContextRingTip);
+        HideGenStats();
+        HidePrefillProgress();
     }
 
     // ---- file explorer ------------------------------------------------------
@@ -2804,9 +3266,9 @@ public partial class MainWindow : Window
     private void OnRefreshTree(object sender, RoutedEventArgs e) => _ = RefreshTreeAsync();
 
     /// <summary>Lazily fill a folder's children the first time it is expanded.</summary>
-    private void OnTreeItemExpanded(object sender, RoutedEventArgs e)
+    private void OnTreeItemExpanded(object? sender, RoutedEventArgs e)
     {
-        if (e.OriginalSource is not TreeViewItem { DataContext: FileNode node } || !node.IsDirectory)
+        if (e.Source is not TreeViewItem { DataContext: FileNode node } || !node.IsDirectory)
             return;
 
         if (node.Children.Count == 1 && node.Children[0].IsPlaceholder)
@@ -2817,7 +3279,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private void OnTreeDoubleClick(object sender, MouseButtonEventArgs e)
+    private void OnTreeDoubleClick(object sender, TappedEventArgs e)
     {
         if (FileTree.SelectedItem is FileNode { IsDirectory: false } node)
             OpenFileInEditor(node.FullPath);
@@ -2825,7 +3287,10 @@ public partial class MainWindow : Window
 
     /// <summary>Show or hide the explorer column.</summary>
     private void OnToggleExplorer(object sender, RoutedEventArgs e)
-        => ExplorerCol.Width = ExplorerCol.Width.Value > 0 ? new GridLength(0) : new GridLength(250);
+    {
+        ExplorerPanel.IsVisible = !ExplorerPanel.IsVisible;
+        ExplorerSplitter.IsVisible = ExplorerPanel.IsVisible;
+    }
 
     // ---- code editor --------------------------------------------------------
 
@@ -2871,8 +3336,8 @@ public partial class MainWindow : Window
             _editorDiskWrite = info.LastWriteTimeUtc;
             _editorDirty = false;
             EditorSaveButton.IsEnabled = false;
-            EditorTitle.Text = Path.GetFileName(path);
-            EditorTitle.ToolTip = path;
+            EditorFileName.Text = Path.GetFileName(path);
+            ToolTip.SetTip(EditorFileName, path);
             ShowEditor(true);
         }
         catch (Exception ex)
@@ -2882,20 +3347,13 @@ public partial class MainWindow : Window
         }
     }
 
-    /// <summary>Toggle the editor column open/closed and its splitter.</summary>
+    /// <summary>Toggle the editor panel open/closed and its splitter.</summary>
     private void ShowEditor(bool show)
     {
-        if (show)
+        EditorPanel.IsVisible = show;
+        EditorSplitter.IsVisible = show;
+        if (!show)
         {
-            EditorCol.Width = new GridLength(1.4, GridUnitType.Star);
-            EditorCol.MinWidth = 260;
-            EditorSplitter.Visibility = Visibility.Visible;
-        }
-        else
-        {
-            EditorCol.Width = new GridLength(0);
-            EditorCol.MinWidth = 0;
-            EditorSplitter.Visibility = Visibility.Collapsed;
             _editorPath = null;
             _editorDirty = false;
         }
@@ -2906,12 +3364,12 @@ public partial class MainWindow : Window
         if (_loadingEditor || _editorPath is null || _editorDirty) return;
         _editorDirty = true;
         EditorSaveButton.IsEnabled = true;
-        EditorTitle.Text = Path.GetFileName(_editorPath) + " *";
+        EditorFileName.Text = Path.GetFileName(_editorPath) + " *";
     }
 
-    private void OnEditorKeyDown(object sender, KeyEventArgs e)
+    private void OnEditorKeyDown(object? sender, KeyEventArgs e)
     {
-        if (e.Key == Key.S && (Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control)
+        if (e.Key == Key.S && e.KeyModifiers == KeyModifiers.Control)
         {
             e.Handled = true;
             SaveEditor();
@@ -2929,7 +3387,7 @@ public partial class MainWindow : Window
             _editorDirty = false;
             _editorDiskWrite = File.GetLastWriteTimeUtc(_editorPath);
             EditorSaveButton.IsEnabled = false;
-            EditorTitle.Text = Path.GetFileName(_editorPath);
+            EditorFileName.Text = Path.GetFileName(_editorPath);
             _ = RefreshTreeAsync();        // file is now modified per git
             _ = UpdateRepoBadgeAsync();
         }
@@ -2939,14 +3397,14 @@ public partial class MainWindow : Window
         }
     }
 
-    private void OnEditorClose(object sender, RoutedEventArgs e)
+    private async void OnEditorClose(object sender, RoutedEventArgs e)
     {
         if (_editorDirty && _editorPath is not null)
         {
-            var choice = MessageBox.Show(
+            var choice = await MessageBox.ShowAsync(
                 this, $"Save changes to {Path.GetFileName(_editorPath)}?", "Unsaved changes",
-                MessageBoxButton.YesNoCancel, MessageBoxImage.Question);
-            if (choice == MessageBoxResult.Cancel) return;
+                MessageBoxButton.YesNo);
+            if (choice == MessageBoxResult.No) return;
             if (choice == MessageBoxResult.Yes) SaveEditor();
         }
         ShowEditor(false);
@@ -2975,7 +3433,7 @@ public partial class MainWindow : Window
             _editorDiskWrite = write;
             _editorDirty = false;
             EditorSaveButton.IsEnabled = false;
-            EditorTitle.Text = Path.GetFileName(_editorPath);
+            EditorFileName.Text = Path.GetFileName(_editorPath);
         }
         catch { /* leave the current buffer as-is on any read error */ }
     }
@@ -3015,10 +3473,18 @@ public partial class MainWindow : Window
         }
         _backend.LogLine -= OnBackendLog;
         try { _backend.Dispose(); } catch { }
+        if (_engine is not null) _engine.LogLine -= OnBackendLog;
         try { _engine?.Dispose(); } catch { }
         try { _ollama?.Dispose(); } catch { }
         try { _flushLock.Dispose(); } catch { }
         try { _modelLoadLock.Dispose(); } catch { }
+        // Cancel any in-flight model pull and release the store cancellation sources.
+        try { _pullCts?.Cancel(); _pullCts?.Dispose(); } catch { }
+        try { _storeCts.Cancel(); _storeCts.Dispose(); } catch { }
+        // Stop the auto-hide UI timers; a ticking DispatcherTimer keeps the window
+        // referenced (via the dispatcher's timer list) after it closes.
+        try { _genHideTimer?.Stop(); } catch { }
+        try { _prefillHideTimer?.Stop(); } catch { }
     }
 
     // ---- misc ---------------------------------------------------------------
@@ -3051,4 +3517,745 @@ public partial class MainWindow : Window
         => n >= 1_000_000 ? $"{n / 1_000_000.0:0.0}M"
          : n >= 1_000 ? $"{n / 1_000.0:0.0}k"
          : n.ToString();
+
+    // =================== EMBEDDED TAB VIEWS & LOGIC ===================
+
+    // ---- Sidebar Tab Navigation ----
+    private void OnSidebarTabClick(object? sender, RoutedEventArgs e)
+    {
+        if (sender is Button btn && btn.Tag is string tagStr && int.TryParse(tagStr, out int index))
+        {
+            MainTabControl.SelectedIndex = index;
+
+            // Toggle active classes on tab buttons
+            TabChatBtn.Classes.Remove("active");
+            TabStoreBtn.Classes.Remove("active");
+            TabSettingsBtn.Classes.Remove("active");
+
+            btn.Classes.Add("active");
+
+            // Refresh the Store every time it is shown so the disk-space line, the
+            // installed-size totals, and the "Installed" tags are current. The one-shot
+            // refresh at window load runs before the engine is up, so without this the
+            // free-space/usage figures stay stale until the user hits Refresh manually.
+            if (index == 1 && !_storeBusy)
+            {
+                _ = RefreshStoreAsync();
+            }
+
+            // If switching to Settings, reload Settings state
+            if (index == 2)
+            {
+                LoadSettingsToUi();
+            }
+        }
+    }
+
+    // ---- Settings Ported Logic ----
+    private void LoadSettingsToUi()
+    {
+        try
+        {
+            // App settings
+            HostBox.Text = _settings.Host;
+            PortBox.Text = _settings.Port.ToString();
+            OllamaBox.Text = _settings.OllamaUrl;
+            ExePathBox.Text = _settings.AgentServerPath;
+            ContextLenBox.Text = _settings.ContextLength > 0 ? _settings.ContextLength.ToString() : "";
+            MaxIterBox.Text = _settings.MaxIterations.ToString();
+            WorkDirBox.Text = _settings.DefaultWorkingDir;
+
+            // VRAM & Engine settings
+            SelectKvCacheType(_settings.KvCacheType);
+            FlashAttentionBox.IsChecked = _settings.EnableFlashAttention;
+            AutoCompactBox.IsChecked = _settings.AutoCompact;
+            DeviceCpuRadio.IsChecked = _settings.ComputeDevice == ComputeDevice.Cpu;
+            DeviceGpuRadio.IsChecked = _settings.ComputeDevice != ComputeDevice.Cpu;
+
+            // Populate the default-model picker from the models actually installed in
+            // Ollama (mirrors the top-bar model dropdown). Conversation titles are NOT
+            // models, so they must never seed this list. The saved/configured model is
+            // appended just below when it is not already present.
+            ModelBox.Items.Clear();
+            foreach (var entry in ModelCombo.Items.OfType<ModelEntry>())
+            {
+                if (!string.IsNullOrWhiteSpace(entry.Name) && !ModelBox.Items.Contains(entry.Name))
+                    ModelBox.Items.Add(entry.Name);
+            }
+
+            _settingsSpec = AgentSpecProvider.LoadRaw();
+            var llm = _settingsSpec["llm"];
+            var model = StripProvider(llm?["model"]?.GetValue<string>() ?? "");
+            
+            if (!string.IsNullOrEmpty(model) && !ModelBox.Items.Contains(model))
+                ModelBox.Items.Add(model);
+                
+            ModelBox.Text = model;
+            ApiKeyBox.Text = llm?["api_key"]?.GetValue<string>() ?? "";
+            BaseUrlBox.Text = llm?["base_url"]?.GetValue<string>() ?? "";
+            TemperatureBox.Text = llm?["temperature"]?.GetValue<double>().ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "";
+            SelectReasoning(llm?["reasoning_effort"]?.GetValue<string>());
+            NonNativeBox.IsChecked = !(llm?["native_tool_calling"]?.GetValue<bool>() ?? false);
+            CondenserBox.Text = (_settingsSpec["condenser"]?["max_size"]?.GetValue<int>() ?? 240).ToString();
+
+            // Enable elements
+            ModelBox.IsEnabled = true;
+            ApiKeyBox.IsEnabled = true;
+            BaseUrlBox.IsEnabled = true;
+            TemperatureBox.IsEnabled = true;
+            ReasoningBox.IsEnabled = true;
+            CondenserBox.IsEnabled = true;
+            NonNativeBox.IsEnabled = true;
+        }
+        catch
+        {
+            // No agent config yet
+            ModelBox.IsEnabled = false;
+            ApiKeyBox.IsEnabled = false;
+            BaseUrlBox.IsEnabled = false;
+            TemperatureBox.IsEnabled = false;
+            ReasoningBox.IsEnabled = false;
+            CondenserBox.IsEnabled = false;
+            NonNativeBox.IsEnabled = false;
+        }
+    }
+
+    private void SelectReasoning(string? value)
+    {
+        value ??= "high";
+        foreach (var obj in ReasoningBox.Items)
+            if (obj is ComboBoxItem it && (it.Content as string) == value)
+            {
+                ReasoningBox.SelectedItem = it;
+                return;
+            }
+        ReasoningBox.SelectedIndex = 0;
+    }
+
+    private void SelectKvCacheType(string? value)
+    {
+        value = (value ?? "f16").Trim().ToLowerInvariant();
+        foreach (var obj in KvCacheBox.Items)
+            if (obj is ComboBoxItem it && (it.Tag as string) == value)
+            {
+                KvCacheBox.SelectedItem = it;
+                return;
+            }
+        KvCacheBox.SelectedIndex = 0;
+    }
+
+    private async void OnSaveSettings(object? sender, RoutedEventArgs e)
+    {
+        if (!int.TryParse(PortBox.Text, out var port) || port < 1 || port > 65535)
+        {
+            await MessageBox.ShowAsync(this, "Port must be a number between 1 and 65535.");
+            return;
+        }
+
+        int ctx = 0;
+        var ctxText = ContextLenBox.Text?.Trim();
+        if (string.IsNullOrWhiteSpace(ctxText))
+            ctx = 0;
+        else if (!int.TryParse(ctxText, out ctx) || ctx < 1024)
+        {
+            await MessageBox.ShowAsync(this, "Max context must be a number >= 1024, or blank for auto.");
+            return;
+        }
+
+        if (!int.TryParse(MaxIterBox.Text, out var maxIter) || maxIter < 1)
+        {
+            await MessageBox.ShowAsync(this, "Max iterations must be a positive number.");
+            return;
+        }
+
+        double? temperature = null;
+        if (!string.IsNullOrWhiteSpace(TemperatureBox.Text))
+        {
+            if (!double.TryParse(TemperatureBox.Text, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var t))
+            {
+                await MessageBox.ShowAsync(this, "Temperature must be a number (or blank).");
+                return;
+            }
+            temperature = t;
+        }
+
+        int condenser = 240;
+        if (_settingsSpec is not null && (!int.TryParse(CondenserBox.Text, out condenser) || condenser < 10))
+        {
+            await MessageBox.ShowAsync(this, "Auto-compact threshold must be a number >= 10.");
+            return;
+        }
+
+        // Save app settings
+        var previousContext = _settings.ContextLength;
+        _settings.Host = HostBox.Text?.Trim() ?? "";
+        _settings.Port = port;
+        _settings.OllamaUrl = OllamaBox.Text?.Trim() ?? "";
+        _settings.AgentServerPath = ExePathBox.Text?.Trim() ?? "";
+        _settings.ContextLength = ctx;
+        var contextChanged = previousContext != _settings.ContextLength;
+        _settings.MaxIterations = maxIter;
+        _settings.DefaultWorkingDir = WorkDirBox.Text?.Trim() ?? "";
+        _settings.KvCacheType = (KvCacheBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "f16";
+        _settings.EnableFlashAttention = FlashAttentionBox.IsChecked == true;
+        _settings.AutoCompact = AutoCompactBox.IsChecked == true;
+        var previousDevice = _settings.ComputeDevice;
+        _settings.ComputeDevice = DeviceCpuRadio.IsChecked == true ? ComputeDevice.Cpu : ComputeDevice.Gpu;
+        var deviceChanged = previousDevice != _settings.ComputeDevice;
+        _settings.Save();
+
+        // Save model/agent config
+        if (_settingsSpec is not null)
+        {
+            try
+            {
+                var model = ToModelField(ModelBox.Text?.Trim() ?? "");
+                var apiKey = ApiKeyBox.Text?.Trim() ?? "";
+                var baseUrl = BaseUrlBox.Text?.Trim() ?? "";
+                var reasoning = (ReasoningBox.SelectedItem as ComboBoxItem)?.Content as string ?? "high";
+                var nonNative = NonNativeBox.IsChecked == true;
+
+                ApplyLlm(_settingsSpec["llm"], model, apiKey, baseUrl, temperature, reasoning, nonNative);
+                ApplyLlm(_settingsSpec["condenser"]?["llm"], model, apiKey, baseUrl, temperature, reasoning, nonNative);
+                if (_settingsSpec["condenser"] is JsonObject cond) cond["max_size"] = condenser;
+
+                AgentSpecProvider.Save(_settingsSpec);
+            }
+            catch (Exception ex)
+            {
+                await MessageBox.ShowAsync(this, $"Could not save model settings: {ex.Message}");
+                return;
+            }
+        }
+
+        // Reload everything that settings can affect.
+        _settings = AppSettings.Load();
+
+        _ollama?.Dispose();
+        _ollama = new OllamaClient(_settings.OllamaUrl);
+        await RefreshAssumedContextWindowAsync();
+
+        // A compute-device OR context change only takes effect when the engine process
+        // is relaunched (accelerator visibility and OLLAMA_CONTEXT_LENGTH are both
+        // fixed at startup). Rebuild the manager so the next Start re-evaluates with
+        // the new values instead of reusing the stale (already-built) manager at the
+        // old context - which is why a changed "Max context" previously never applied.
+        if (deviceChanged || contextChanged) RebuildEngineManager();
+
+        var deviceNote = deviceChanged
+            ? (_settings.ComputeDevice == ComputeDevice.Cpu
+                ? "\n\nCompute device set to CPU only - the engine will restart on the next Start (expect slower responses)."
+                : "\n\nCompute device set to GPU - the engine will restart on the next Start.")
+            : "";
+        await MessageBox.ShowAsync(this, "Settings and VRAM optimizations saved and applied successfully!" + deviceNote);
+    }
+
+    private static void ApplyLlm(JsonNode? llm, string model, string apiKey, string baseUrl,
+        double? temperature, string reasoning, bool nonNative)
+    {
+        if (llm is not JsonObject o) return;
+        if (!string.IsNullOrEmpty(model)) o["model"] = model;
+        o["api_key"] = string.IsNullOrEmpty(apiKey) ? "local-llm" : apiKey;
+        if (!string.IsNullOrEmpty(baseUrl)) o["base_url"] = baseUrl;
+        o["temperature"] = temperature is null ? null : JsonValue.Create(temperature.Value);
+        o["reasoning_effort"] = reasoning;
+        o["native_tool_calling"] = !nonNative;
+    }
+
+    private async void OnBrowseExe(object? sender, RoutedEventArgs e)
+    {
+        var files = await StorageProvider.OpenFilePickerAsync(new Avalonia.Platform.Storage.FilePickerOpenOptions
+        {
+            Title = "Select agent-server.exe",
+            AllowMultiple = false,
+            FileTypeFilter = new[] { new Avalonia.Platform.Storage.FilePickerFileType("Executables") { Patterns = new[] { "*.exe" } } }
+        });
+        if (files.Count > 0)
+        {
+            ExePathBox.Text = files[0].Path.LocalPath;
+        }
+    }
+
+    // ---- Model Store Ported Logic ----
+    private async Task RefreshStoreAsync()
+    {
+        try
+        {
+            if (_ollama is null) _ollama = new OllamaClient(_settings.OllamaUrl);
+            var installed = await _ollama.ListInstalledAsync(_storeCts.Token);
+
+            var installedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            long totalBytes = 0;
+            foreach (var m in installed)
+            {
+                totalBytes += m.SizeBytes;
+                installedNames.Add(m.Name);
+            }
+
+            DiskSummary.Text = BuildDiskSummary(totalBytes);
+
+            _unfilteredCatalog.Clear();
+            foreach (var e in ModelAdvisor.Catalog)
+            {
+                bool present = installedNames.Contains(e.Model)
+                               || installedNames.Contains(e.Model + ":latest");
+                _unfilteredCatalog.Add(new CatalogRow(e.Model, e.Tier, e.TierOrder, e.Category,
+                                             e.Recommended, e.Accuracy, e.Note, present));
+            }
+
+            ApplyStoreFilter();
+        }
+        catch
+        {
+            DiskSummary.Text = "Ollama connection offline. Ensure Ollama is running.";
+        }
+    }
+
+    private async Task InstallStoreAsync(string model)
+    {
+        model = (model ?? "").Trim();
+        if (_storeBusy || string.IsNullOrWhiteSpace(model)) return;
+
+        SetStoreBusy(true);
+        _pullCts = CancellationTokenSource.CreateLinkedTokenSource(_storeCts.Token);
+        StopInstallButton.IsVisible = true;
+        StopInstallButton.IsEnabled = true;
+        ProgressText.Text = $"Preparing to install {model}...";
+        ProgressBarCtl.Value = 0;
+        try
+        {
+            int lastPercent = -1;
+            string lastStatus = "";
+            var progress = new Progress<PullProgress>(p =>
+            {
+                int pct = (int)p.Percent;
+                if (pct == lastPercent && p.Status == lastStatus) return;
+                lastPercent = pct;
+                lastStatus = p.Status;
+
+                ProgressBarCtl.Value = p.Percent;
+                ProgressText.Text = p.Total > 0
+                    ? $"Installing {model}: {p.Status} ({FormatBytes(p.Completed)} / {FormatBytes(p.Total)}, {pct}%)"
+                    : $"Installing {model}: {p.Status}";
+            });
+
+            bool ok = await _ollama!.PullModelAsync(model, progress, _pullCts.Token);
+            if (ok)
+            {
+                _ollama.ClearCache();
+                InstallNameBox.Clear();
+                await RefreshStoreAsync();
+                await PopulateModelsAsync();
+            }
+            else
+            {
+                await MessageBox.ShowAsync(this, $"Install of '{model}' did not complete. Check the model name and try again.", "Model Store");
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            await MessageBox.ShowAsync(this, $"Could not install '{model}'.\n\n{ex.Message}", "Model Store");
+        }
+        finally
+        {
+            StopInstallButton.IsVisible = false;
+            _pullCts?.Dispose();
+            _pullCts = null;
+            SetStoreBusy(false);
+        }
+    }
+
+    private async Task DeleteStoreAsync(string model)
+    {
+        if (_storeBusy) return;
+
+        var confirm = await MessageBox.ShowAsync(this,
+            $"Remove '{model}' from disk? You can reinstall it later.",
+            "Remove model", MessageBoxButton.YesNo);
+        if (confirm != MessageBoxResult.Yes) return;
+
+        SetStoreBusy(true);
+        ProgressText.Text = $"Removing {model}...";
+        ProgressBarCtl.IsIndeterminate = true;
+        try
+        {
+            bool ok = await _ollama!.DeleteModelAsync(model, _storeCts.Token);
+            if (ok)
+            {
+                _ollama.ClearCache();
+                await RefreshStoreAsync();
+                await PopulateModelsAsync();
+            }
+            else
+            {
+                await MessageBox.ShowAsync(this, $"Could not remove '{model}'.", "Model Store");
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            await MessageBox.ShowAsync(this, $"Could not remove '{model}'.\n\n{ex.Message}", "Model Store");
+        }
+        finally
+        {
+            ProgressBarCtl.IsIndeterminate = false;
+            SetStoreBusy(false);
+        }
+    }
+
+    private void SetStoreBusy(bool busy)
+    {
+        _storeBusy = busy;
+        ProgressPanel.IsVisible = busy;
+        if (!busy) ProgressBarCtl.IsIndeterminate = false;
+
+        InstallNameBox.IsEnabled = !busy;
+        InstallByNameButton.IsEnabled = !busy;
+        RefreshButton.IsEnabled = !busy;
+        SearchBox.IsEnabled = !busy;
+        CategoryFilter.IsEnabled = !busy;
+        AccuracyFilter.IsEnabled = !busy;
+    }
+
+    private void OnModelActionClick(object? sender, RoutedEventArgs e)
+    {
+        if (sender is Button btn && btn.DataContext is CatalogRow row)
+        {
+            if (row.IsInstalled)
+                _ = DeleteStoreAsync(row.Name);
+            else
+                _ = InstallStoreAsync(row.Name);
+        }
+    }
+
+    private void OnStopInstall(object? sender, RoutedEventArgs e)
+    {
+        if (_pullCts is null) return;
+        ProgressText.Text = "Stopping...";
+        StopInstallButton.IsEnabled = false;
+        _pullCts.Cancel();
+    }
+
+    private async void OnInstallByName(object? sender, RoutedEventArgs e)
+        => await InstallStoreAsync(InstallNameBox.Text ?? "");
+
+    private async void OnInstallNameKeyDown(object? sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter) await InstallStoreAsync(InstallNameBox.Text ?? "");
+    }
+
+    private void OnSearchBoxTextChanged(object? sender, TextChangedEventArgs e)
+        => ApplyStoreFilter();
+
+    private void OnFilterSelectionChanged(object? sender, SelectionChangedEventArgs e)
+        => ApplyStoreFilter();
+
+    private void OnRefresh(object? sender, RoutedEventArgs e)
+    {
+        if (_storeBusy) return;
+        SetStoreBusy(true);
+        try { _ollama?.ClearCache(); _ = RefreshStoreAsync(); }
+        finally { SetStoreBusy(false); }
+    }
+
+    private void OnOpenGuide(object? sender, RoutedEventArgs e)
+    {
+        _ = MessageBox.ShowAsync(this, "VRAM Recommendations:\n\n"
+            + "- 6GB VRAM: Try Mistral 7B or Qwen 2.5 7B with q4_0 quantization.\n"
+            + "- 12GB VRAM: Try Llama 3 8B or Mistral 12B.\n"
+            + "- 16GB+ VRAM: Try Qwen 2.5 14B or larger models.", "VRAM Model Guide");
+    }
+
+    /// <summary>
+    /// Open the in-form "Installed Models" overlay (no separate window) and load the
+    /// current list. Each row shows the model name, on-disk size, and a Remove button.
+    /// </summary>
+    private async void OnShowInstalledModels(object? sender, RoutedEventArgs e)
+    {
+        InstalledOverlay.IsVisible = true;
+        await RefreshInstalledModelsPanelAsync();
+    }
+
+    /// <summary>Close the Installed Models overlay (ignored while a remove is in flight).</summary>
+    private void OnCloseInstalledModels(object? sender, RoutedEventArgs e)
+    {
+        if (_installedPanelBusy) return;
+        InstalledOverlay.IsVisible = false;
+    }
+
+    /// <summary>
+    /// (Re)load the installed-model list into the overlay, updating the summary line,
+    /// running total, and the empty/error status text. Best-effort: engine-unreachable
+    /// and empty cases are surfaced inline rather than as popups.
+    /// </summary>
+    private async Task RefreshInstalledModelsPanelAsync()
+    {
+        if (_ollama is null) _ollama = new OllamaClient(_settings.OllamaUrl);
+
+        IReadOnlyList<InstalledModel> installed;
+        try
+        {
+            installed = await _ollama.ListInstalledAsync(_storeCts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            return;   // app/store shutting down; nothing to show
+        }
+        catch
+        {
+            _installedModels.Clear();
+            InstalledOverlaySummary.Text = "";
+            InstalledOverlayTotal.Text = "";
+            SetInstalledOverlayStatus(
+                "Could not reach the StayVibin Engine. Press Start (or wait for the "
+                + "engine to come up) and reopen this list.");
+            return;
+        }
+
+        _installedModels.Clear();
+        long total = 0;
+        foreach (var m in installed.OrderBy(m => m.Name, StringComparer.OrdinalIgnoreCase))
+        {
+            total += m.SizeBytes;
+            _installedModels.Add(new InstalledModelRow(m.Name, m.SizeBytes));
+        }
+
+        if (_installedModels.Count == 0)
+        {
+            InstalledOverlaySummary.Text = "";
+            InstalledOverlayTotal.Text = "";
+            SetInstalledOverlayStatus(
+                "No models are installed yet. Use a Store card or \"Install by name\" "
+                + "to download one.");
+            return;
+        }
+
+        SetInstalledOverlayStatus(null);
+        InstalledOverlaySummary.Text =
+            $"{_installedModels.Count} {(_installedModels.Count == 1 ? "model" : "models")} installed";
+        InstalledOverlayTotal.Text = $"Total on disk: {FormatBytes(total)}";
+    }
+
+    /// <summary>Show (or hide, when null) the overlay's inline status/empty/error line.</summary>
+    private void SetInstalledOverlayStatus(string? text)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            InstalledOverlayStatus.IsVisible = false;
+            InstalledOverlayStatus.Text = "";
+        }
+        else
+        {
+            InstalledOverlayStatus.Text = text;
+            InstalledOverlayStatus.IsVisible = true;
+        }
+    }
+
+    /// <summary>
+    /// Remove a single model from the Installed Models overlay after confirmation,
+    /// then refresh the overlay, the store catalog, and the model picker. Guards
+    /// against overlapping removes/closes via <see cref="_installedPanelBusy"/>.
+    /// </summary>
+    private async void OnRemoveInstalledModel(object? sender, RoutedEventArgs e)
+    {
+        if (_installedPanelBusy) return;
+        if (sender is not Button { DataContext: InstalledModelRow row }) return;
+
+        var confirm = await MessageBox.ShowAsync(this,
+            $"Remove '{row.Name}' from disk? You can reinstall it later.",
+            "Remove model", MessageBoxButton.YesNo);
+        if (confirm != MessageBoxResult.Yes) return;
+
+        _installedPanelBusy = true;
+        SetInstalledOverlayStatus($"Removing {row.Name}...");
+        try
+        {
+            if (_ollama is null) _ollama = new OllamaClient(_settings.OllamaUrl);
+            bool ok = await _ollama.DeleteModelAsync(row.Name, _storeCts.Token);
+            if (!ok)
+            {
+                SetInstalledOverlayStatus($"Could not remove '{row.Name}'. Try again.");
+                return;
+            }
+
+            // Removal succeeded: invalidate caches and refresh everything that lists
+            // models so the catalog tags, picker, and this overlay all stay in sync.
+            _ollama.ClearCache();
+            await RefreshStoreAsync();
+            await PopulateModelsAsync();
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            SetInstalledOverlayStatus($"Could not remove '{row.Name}': {ex.Message}");
+            return;
+        }
+        finally
+        {
+            _installedPanelBusy = false;
+        }
+
+        // Re-read the list outside the busy guard so the just-removed row disappears
+        // and the totals update.
+        await RefreshInstalledModelsPanelAsync();
+    }
+
+    private readonly List<CatalogRow> _unfilteredCatalog = new();
+
+    private void ApplyStoreFilter()
+    {
+        if (CategoryFilter is null || AccuracyFilter is null || SearchBox is null)
+            return;
+
+        var categoryItem = CategoryFilter.SelectedItem as ComboBoxItem;
+        var category = categoryItem?.Content as string;
+        
+        var accuracyItem = AccuracyFilter.SelectedItem as ComboBoxItem;
+        var accuracyText = accuracyItem?.Content as string;
+
+        var searchText = SearchBox.Text?.Trim();
+
+        var matches = _unfilteredCatalog.Where(row =>
+        {
+            if (!string.IsNullOrEmpty(category) && category != "All categories"
+                && !string.Equals(category, row.Category, StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            var minAccuracy = accuracyText switch
+            {
+                "Tier 1: Max Accuracy" => ModelAdvisor.AccuracyTier.VeryGood,
+                "Tier 2: Strong Accuracy" => ModelAdvisor.AccuracyTier.Good,
+                "Tier 3: Moderate Accuracy" => ModelAdvisor.AccuracyTier.Fair,
+                "Specialized Tools Only" => ModelAdvisor.AccuracyTier.Basic,
+                _ => (ModelAdvisor.AccuracyTier?)null,
+            };
+            if (minAccuracy is { } min && row.Accuracy < min) return false;
+
+            if (!string.IsNullOrEmpty(searchText)
+                && row.Name.IndexOf(searchText, StringComparison.OrdinalIgnoreCase) < 0
+                && row.Note.IndexOf(searchText, StringComparison.OrdinalIgnoreCase) < 0)
+                return false;
+
+            return true;
+        })
+        // Group installed models to the top so they are easy to find, then the
+        // recommended picks, then by accuracy and VRAM tier within each group.
+        .OrderByDescending(row => row.IsInstalled)
+        .ThenByDescending(row => row.Recommended)
+        .ThenByDescending(row => row.Accuracy)
+        .ThenBy(row => row.TierOrder)
+        .ThenBy(row => row.Name, StringComparer.OrdinalIgnoreCase)
+        .ToList();
+
+        _availableStoreModels.Clear();
+        foreach (var m in matches)
+        {
+            _availableStoreModels.Add(m);
+        }
+    }
+
+    private static string BuildDiskSummary(long totalBytes)
+    {
+        var used = $"Models use {FormatBytes(totalBytes)}";
+        try
+        {
+            var dir = ModelsDirectory();
+            var root = Path.GetPathRoot(dir);
+            if (!string.IsNullOrEmpty(root))
+            {
+                var drive = new DriveInfo(root);
+                if (drive.IsReady)
+                    return $"{used} - {FormatBytes(drive.AvailableFreeSpace)} free on {drive.Name}";
+            }
+        }
+        catch { /* free-space lookup is best-effort */ }
+        return used;
+    }
+
+    private static string ModelsDirectory()
+    {
+        var env = Environment.GetEnvironmentVariable("OLLAMA_MODELS");
+        if (!string.IsNullOrWhiteSpace(env)) return env!;
+        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        return Path.Combine(home, ".ollama", "models");
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        double gb = bytes / 1024d / 1024d / 1024d;
+        if (gb >= 1) return $"{gb:0.0} GB";
+        double mb = bytes / 1024d / 1024d;
+        return $"{mb:0} MB";
+    }
+}
+
+/// <summary>A catalog row; visibility helpers swap the Install button for an "Installed" label.</summary>
+public sealed class CatalogRow
+{
+    public string Name { get; }
+    public string Tier { get; }
+    public int TierOrder { get; }
+    public string Category { get; }
+    public bool Recommended { get; }
+    public ModelAdvisor.AccuracyTier Accuracy { get; }
+    public string Note { get; }
+    public bool IsInstalled { get; set; }
+
+    public CatalogRow(string name, string tier, int tierOrder, string category,
+                      bool recommended, ModelAdvisor.AccuracyTier accuracy,
+                      string note, bool isInstalled)
+    {
+        Name = name;
+        Tier = tier;
+        TierOrder = tierOrder;
+        Category = category;
+        Recommended = recommended;
+        Accuracy = accuracy;
+        Note = note;
+        IsInstalled = isInstalled;
+    }
+
+    public bool CanInstall => !IsInstalled;
+    public string ActionText => IsInstalled ? "Remove" : "Install";
+    public string AccuracyDisplay => ModelAdvisor.AccuracyLabel(Accuracy);
+    public string VramDisplay => Tier;
+    public string Description => Note;
+
+    /// <summary>Tier-colored brush for the accuracy tag (green/amber/red), resolved
+    /// from the shared app palette so it matches the rest of the UI.</summary>
+    public IBrush AccuracyBrush =>
+        Application.Current is { } app
+        && app.TryFindResource(ModelAdvisor.AccuracyBrushKey(Accuracy), out var v)
+        && v is IBrush b
+            ? b
+            : Brushes.Gray;
+}
+
+/// <summary>
+/// One row in the in-form "Installed Models" overlay: an installed model's tag name
+/// and its on-disk size. Immutable - the overlay rebuilds the list after any change.
+/// </summary>
+public sealed class InstalledModelRow
+{
+    public string Name { get; }
+    public long SizeBytes { get; }
+
+    public InstalledModelRow(string name, long sizeBytes)
+    {
+        Name = name;
+        SizeBytes = sizeBytes;
+    }
+
+    /// <summary>Human-readable size (GB/MB) shown in the row's size chip.</summary>
+    public string SizeDisplay
+    {
+        get
+        {
+            double gb = SizeBytes / 1024d / 1024d / 1024d;
+            if (gb >= 1) return $"{gb:0.0} GB";
+            double mb = SizeBytes / 1024d / 1024d;
+            return $"{mb:0} MB";
+        }
+    }
 }

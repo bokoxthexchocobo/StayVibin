@@ -1,5 +1,6 @@
 using System.Net.Http;
 using System.Net.Http.Json;
+using System.Net;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -24,6 +25,30 @@ public enum AgentPermissionPolicy
 {
     Ask,
     AllowAll
+}
+
+/// <summary>HTTP failure from the local agent-server with status preserved for recovery.</summary>
+public sealed class AgentServerException : InvalidOperationException
+{
+    public AgentServerException(string operation, HttpStatusCode statusCode, string responseText)
+        : base($"{operation} failed ({(int)statusCode}): {responseText}")
+    {
+        StatusCode = statusCode;
+        ResponseText = responseText;
+    }
+
+    public HttpStatusCode StatusCode { get; }
+    public string ResponseText { get; }
+    public bool IsNotFound => StatusCode == HttpStatusCode.NotFound;
+}
+
+/// <summary>Best-effort delete result, including non-success status for UI recovery.</summary>
+public sealed record ConversationDeleteResult(
+    bool Succeeded,
+    HttpStatusCode? StatusCode = null,
+    string ResponseText = "")
+{
+    public bool IsNotFound => StatusCode == HttpStatusCode.NotFound;
 }
 
 /// <summary>
@@ -95,7 +120,7 @@ public sealed class AgentServerClient : IDisposable
         using var resp = await _http.PostAsJsonAsync($"{_baseUrl}/api/conversations", body, ct);
         var text = await resp.Content.ReadAsStringAsync(ct);
         if (!resp.IsSuccessStatusCode)
-            throw new InvalidOperationException($"Create conversation failed ({(int)resp.StatusCode}): {text}");
+            throw new AgentServerException("Create conversation", resp.StatusCode, text);
 
         using var doc = JsonDocument.Parse(text);
         ConversationId = doc.RootElement.GetProperty("id").GetString()
@@ -157,14 +182,20 @@ public sealed class AgentServerClient : IDisposable
     /// <summary>Permanently delete a persisted conversation. Returns true on success.</summary>
     public static async Task<bool> DeleteConversationAsync(
         string baseUrl, string id, CancellationToken ct = default)
+        => (await DeleteConversationDetailedAsync(baseUrl, id, ct)).Succeeded;
+
+    /// <summary>Permanently delete a persisted conversation and report the server status.</summary>
+    public static async Task<ConversationDeleteResult> DeleteConversationDetailedAsync(
+        string baseUrl, string id, CancellationToken ct = default)
     {
         try
         {
             baseUrl = baseUrl.TrimEnd('/');
             using var resp = await _sharedHttp.DeleteAsync($"{baseUrl}/api/conversations/{id}", ct);
-            return resp.IsSuccessStatusCode;
+            var text = await resp.Content.ReadAsStringAsync(ct);
+            return new ConversationDeleteResult(resp.IsSuccessStatusCode, resp.StatusCode, text);
         }
-        catch { return false; }
+        catch (Exception ex) { return new ConversationDeleteResult(false, null, ex.Message); }
     }
 
     /// <summary>
@@ -192,7 +223,11 @@ public sealed class AgentServerClient : IDisposable
                 url += "&page_id=" + Uri.EscapeDataString(pageId!);
 
             using var resp = await _http.GetAsync(url, ct);
-            if (!resp.IsSuccessStatusCode) return;
+            if (!resp.IsSuccessStatusCode)
+            {
+                var errorText = await resp.Content.ReadAsStringAsync(ct);
+                throw new AgentServerException("Replay conversation", resp.StatusCode, errorText);
+            }
 
             var text = await resp.Content.ReadAsStringAsync(ct);
             using var doc = JsonDocument.Parse(text);
@@ -274,7 +309,7 @@ public sealed class AgentServerClient : IDisposable
         if (!resp.IsSuccessStatusCode)
         {
             var text = await resp.Content.ReadAsStringAsync(ct);
-            throw new InvalidOperationException($"Switch model failed ({(int)resp.StatusCode}): {text}");
+            throw new AgentServerException("Switch model", resp.StatusCode, text);
         }
     }
 
@@ -302,8 +337,7 @@ public sealed class AgentServerClient : IDisposable
         if (!resp.IsSuccessStatusCode)
         {
             var text = await resp.Content.ReadAsStringAsync(ct);
-            throw new InvalidOperationException(
-                $"Set permission policy failed ({(int)resp.StatusCode}): {text}");
+            throw new AgentServerException("Set permission policy", resp.StatusCode, text);
         }
     }
 
@@ -837,7 +871,10 @@ public sealed class AgentServerClient : IDisposable
                 if (!string.IsNullOrWhiteSpace(v)) { text = v!; break; }
             }
         }
-        return Truncate(text, 4000);
+        // Search/read observations are often the only grounding weaker local models
+        // ever get. Truncating at 4k chars drops filenames, line ranges, and later
+        // evidence too aggressively, so keep more of the observation in context.
+        return Truncate(text, 12000);
     }
 
     private static string Truncate(string s, int max)

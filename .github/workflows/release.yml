@@ -1,9 +1,12 @@
 name: Release
 
+# Manual-only. The release installer bundles the ~1.6 GB StayVibin Engine, which
+# cannot exist on a hosted runner, so the real bundled installer is built and
+# uploaded locally (see build-installer.ps1 + the release steps in the README). An
+# automatic tag-triggered run could only ever produce an engine-less installer that
+# would overwrite the real release asset, so the push trigger is intentionally off.
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -34,5 +37,5 @@ jobs:
         with:
           files: |
             dist/StayVibin-*-setup.exe
-            bin/Release/net10.0-windows/win-x64/publish/StayVibin.exe
+            bin/Release/net10.0/win-x64/publish/StayVibin.exe
           generate_release_notes: true

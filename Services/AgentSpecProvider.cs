@@ -10,6 +10,24 @@ namespace StayVibin.Services;
 public static class AgentSpecProvider
 {
     /// <summary>
+    /// Short, accuracy-first prompt for smaller local models. These models lose
+    /// reliability when the system prompt is huge, so keep the rules compact and
+    /// concrete: use tools, read before claiming, cite paths, and avoid essays.
+    /// </summary>
+    public const string CompactAgenticSuffix =
+        "You are a capable local coding agent with full tool access.\n"
+        + "- Use tools, do not only describe what you would do.\n"
+        + "- For code questions, search/read the repository first, then answer from what you read.\n"
+        + "- For broad requests, map the repo first: list top folders, use glob/grep broadly, then read likely files.\n"
+        + "- The file viewer can show large chunks; use view_range [start, -1] to continue reading instead of claiming a tiny line cap.\n"
+        + "- Never invent code you have not opened.\n"
+        + "- Cite real file paths when stating facts.\n"
+        + "- Prefer these tools first: grep for content, glob for file names, file_editor to read files, terminal to run commands.\n"
+        + "- If a search returns nothing, widen it instead of repeating the same call.\n"
+        + "- Keep answers short, concrete, and grounded in repository evidence.\n"
+        + "- If you have not read enough to answer accurately, keep investigating with tools instead of guessing.";
+
+    /// <summary>
     /// Agentic, anti-refusal guidance appended to the system prompt. This is what
     /// stops smaller local models from giving up and claiming they "cannot access
     /// the filesystem" the moment one command misbehaves.
@@ -30,7 +48,11 @@ public static class AgentSpecProvider
         + "tool - use 'file_editor' to read or change files and 'grep' to search "
         + "code. To search file CONTENTS use 'grep'; to find files by NAME use "
         + "'glob'; to read or change a file use 'file_editor'; to run a shell command "
-        + "use 'terminal'.\n"
+        + "use 'terminal'. StayVibin raises the default tool output ceilings: file_editor "
+        + "views can return large chunks (about 64k characters), and grep/glob can return "
+        + "up to 500 matching files. Do NOT say you can only read 100 lines or only inspect "
+        + "a few files. If a result is clipped, continue with file_editor view_range "
+        + "[next_line, -1], narrower grep searches, or targeted glob patterns.\n"
         + "- grep/glob 'path' rules (IMPORTANT - getting this wrong is the #1 reason a "
         + "search 'finds nothing'): the search is rooted at your working directory. To "
         + "search the WHOLE project, OMIT the 'path' argument entirely - that is the "
@@ -87,8 +109,12 @@ public static class AgentSpecProvider
         + "- Gather information yourself with your tools instead of asking the user to "
         + "paste files. Only ask the user for a genuine decision, never for data you "
         + "can obtain by reading or searching the repository.\n"
-        + "- For a large audit: first list the top-level directory, then explore the "
-        + "relevant subfolders, reading files in batches, and keep going until done.\n"
+        + "- For broad codebase questions, do NOT ask the user to name specific files. "
+        + "Build the general drift yourself: inspect the workspace snapshot, list the "
+        + "top-level directory, glob for major project files, grep for key symbols, read "
+        + "representative implementations, then narrow down. For a large audit: first "
+        + "list the top-level directory, then explore the relevant subfolders, reading "
+        + "files in batches, and keep going until done.\n"
         + "\n"
         + "Response style - you are a DOER, not a tutor:\n"
         + "- DO the work yourself with your tools. NEVER tell the user to run a command, "
@@ -153,6 +179,25 @@ public static class AgentSpecProvider
         + "- StayVibin may tell you which file the user has open in the editor; treat "
         + "that as a hint for what they care about, but still read the file before "
         + "claiming what is in it.";
+
+    /// <summary>
+    /// Return a prompt profile appropriate for the selected model. Small local models
+    /// need a short, high-signal instruction set; larger models benefit from the full
+    /// operating guide. We infer model scale from the tag and use a conservative
+    /// cutoff so 7B/8B-class models stay on the compact profile.
+    /// </summary>
+    public static string PromptProfileForModel(string? modelField)
+    {
+        var model = StripProviderPrefix(modelField);
+        return ModelTuning.UseCompactPromptProfile(model) ? CompactAgenticSuffix : AgenticSuffix;
+    }
+
+    private static string StripProviderPrefix(string? modelField)
+    {
+        var s = modelField ?? "";
+        var slash = s.IndexOf('/');
+        return slash >= 0 ? s[(slash + 1)..] : s;
+    }
 
     /// <summary>
     /// Sentinel the agent prints on its own line when a plan is ready for the
@@ -251,9 +296,9 @@ public static class AgentSpecProvider
             ["condenser"] = new JsonObject
             {
                 ["llm"] = BuildLlm(modelField, baseUrl, "condenser"),
-                ["max_size"] = 240,
+                ["max_size"] = 320,
                 ["max_tokens"] = null,
-                ["keep_first"] = 2,
+                ["keep_first"] = 6,
                 ["minimum_progress"] = 0.1,
                 ["hard_context_reset_max_retries"] = 5,
                 ["hard_context_reset_context_scaling"] = 0.8,
@@ -320,6 +365,13 @@ public static class AgentSpecProvider
         => _registeredTools = new HashSet<string>(registeredToolNames, StringComparer.Ordinal);
 
     /// <summary>
+    /// Clear the probed optional/alias tool set. Used before a backend restart or a
+    /// failed probe so stale tool availability from a previous server instance never
+    /// leaks into a fresh conversation.
+    /// </summary>
+    public static void ClearAvailableOptionalTools() => _registeredTools = null;
+
+    /// <summary>
     /// Ensure the spec lists the engine search tools (grep + glob). These are the
     /// search primitives local models reach for most; adding them here means existing
     /// saved configs (written before search tools existed) get them at load time too.
@@ -354,6 +406,16 @@ public static class AgentSpecProvider
     {
         var map = new Dictionary<string, string>(StringComparer.Ordinal);
         if (spec["tools"] is not JsonArray tools) return map;
+
+        if (UseCompactToolset(spec))
+        {
+            for (int i = tools.Count - 1; i >= 0; i--)
+            {
+                var n = tools[i]?["name"]?.GetValue<string>();
+                if (!string.IsNullOrEmpty(n) && !CompactToolNames.Contains(n!))
+                    tools.RemoveAt(i);
+            }
+        }
 
         var allowed = AllowedOptionalTools();
 
@@ -407,6 +469,22 @@ public static class AgentSpecProvider
         return set;
     }
 
+    private static bool UseCompactToolset(JsonNode spec)
+    {
+        var modelField = spec["llm"]?["model"]?.GetValue<string>();
+        var model = StripProviderPrefix(modelField);
+        return ModelTuning.UseCompactToolset(model);
+    }
+
+    private static readonly HashSet<string> CompactToolNames =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            "terminal", "file_editor", "grep", "glob", "task_tracker",
+            "search", "find", "read_file", "open_file", "view_file",
+            "list_dir", "list_files", "codebase_search",
+            "FinishTool", "ThinkTool",
+        };
+
     /// <summary>Build one LLM block matching the CLI's agent_settings.json schema.</summary>
     private static JsonObject BuildLlm(string modelField, string baseUrl, string usageId) => new()
     {
@@ -453,7 +531,8 @@ public static class AgentSpecProvider
     private static string NormalizeOpenAiBaseUrl(string url)
     {
         var u = (url ?? "").Trim().TrimEnd('/');
-        if (u.Length == 0) u = "http://localhost:11434";
+        // Default to the bundled StayVibin Engine, never a separately-installed Ollama.
+        if (u.Length == 0) u = StayVibinEngineManager.DefaultBaseUrl;
         if (!u.EndsWith("/v1", StringComparison.OrdinalIgnoreCase)) u += "/v1";
         return u;
     }
@@ -465,8 +544,15 @@ public static class AgentSpecProvider
     /// (which enables native calling for models that support it); we no longer force
     /// the prompt-text fallback, which made capable models leak markup and loop.
     /// </summary>
+    /// <summary>
+    /// max_size we stamp onto the condenser when the user disables automatic
+    /// compaction. It is large enough that the condenser never trips on its own,
+    /// while leaving manual compaction (the context ring) fully functional.
+    /// </summary>
+    public const int AutoCompactDisabledSize = 1_000_000;
+
     public static JsonNode Load(string? workingDir = null, string? workspaceSnapshot = null,
-        string? path = null, PlanMode planMode = PlanMode.Off)
+        string? path = null, PlanMode planMode = PlanMode.Off, bool autoCompact = true)
     {
         path ??= DefaultSettingsPath();
         if (!File.Exists(path))
@@ -479,6 +565,10 @@ public static class AgentSpecProvider
             ?? throw new InvalidDataException("agent_settings.json is empty or invalid.");
 
         ApplyAccuracySettings(node);
+        // When auto-compaction is turned off, push the condenser threshold so high it
+        // never fires automatically; the user compacts manually via the context ring.
+        if (!autoCompact && node["condenser"] is JsonObject cond)
+            cond["max_size"] = AutoCompactDisabledSize;
         NormalizeLocalLlm(node);
         RemoveSubagentTools(node);
         AddSearchTools(node);
@@ -527,18 +617,37 @@ public static class AgentSpecProvider
             llm["enable_encrypted_reasoning"] = false;
             llm["extended_thinking_budget"] = null;
             llm["prompt_cache_retention"] = null;
+
+            // Migrate a legacy stock-Ollama endpoint (port 11434) to the bundled
+            // StayVibin Engine so the app never relies on a separately-installed
+            // Ollama. Preserves any custom remote endpoint the user set themselves.
+            if (IsLegacyOllamaBaseUrl(llm["base_url"]?.GetValue<string>()))
+                llm["base_url"] = StayVibinEngineManager.DefaultBaseUrl + "/v1";
         }
+    }
+
+    /// <summary>
+    /// True when the URL points at a local stock-Ollama default (loopback:11434).
+    /// Used to migrate older configs onto the bundled engine.
+    /// </summary>
+    private static bool IsLegacyOllamaBaseUrl(string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url)) return false;
+        return Uri.TryCreate(url.TrimEnd('/'), UriKind.Absolute, out var u)
+               && (u.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase)
+                   || u.Host.Equals("127.0.0.1", StringComparison.OrdinalIgnoreCase))
+               && u.Port == 11434;
     }
 
     /// <summary>Same as <see cref="Load"/> but builds the workspace snapshot first.</summary>
     public static async Task<JsonNode> LoadAsync(
         string? workingDir = null, string? editorPath = null, string? path = null,
-        PlanMode planMode = PlanMode.Off)
+        PlanMode planMode = PlanMode.Off, bool autoCompact = true)
     {
         var snapshot = workingDir is null
             ? ""
             : await WorkspaceContextService.BuildAsync(workingDir, editorPath);
-        return Load(workingDir, string.IsNullOrWhiteSpace(snapshot) ? null : snapshot, path, planMode);
+        return Load(workingDir, string.IsNullOrWhiteSpace(snapshot) ? null : snapshot, path, planMode, autoCompact);
     }
 
     /// <summary>
@@ -550,10 +659,10 @@ public static class AgentSpecProvider
         if (node["condenser"] is not JsonObject cond) return;
 
         var keep = cond["keep_first"]?.GetValue<int>() ?? 2;
-        if (keep < 4) cond["keep_first"] = 4;
+        if (keep < 6) cond["keep_first"] = 6;
 
         var max = cond["max_size"]?.GetValue<int>() ?? 240;
-        if (max < 280) cond["max_size"] = 280;
+        if (max < 320) cond["max_size"] = 320;
     }
 
     public static string DescribeModel(JsonNode spec)
@@ -622,7 +731,8 @@ public static class AgentSpecProvider
             parts.Add(workspaceSnapshot.Trim());
         if (!string.IsNullOrWhiteSpace(workingDir))
             parts.Add($"Your current working directory is: {workingDir}");
-        parts.Add(AgenticSuffix);
+        var modelField = obj["llm"]?["model"]?.GetValue<string>();
+        parts.Add(PromptProfileForModel(modelField));
 
         var planSuffix = PlanModeSuffix(planMode);
         if (!string.IsNullOrEmpty(planSuffix))

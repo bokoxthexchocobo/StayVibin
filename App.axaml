@@ -1,0 +1,232 @@
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="StayVibin.App"
+             RequestedThemeVariant="Dark">
+
+    <Application.Resources>
+        <!-- Palette & Colors -->
+        <Color x:Key="BgColor">#0C0C0C</Color>
+        <Color x:Key="PanelColor">#121212</Color>
+        <Color x:Key="PanelAltColor">#181818</Color>
+        <Color x:Key="BorderColor">#2A2F3D</Color>
+        <Color x:Key="TextColor">#E6E8EE</Color>
+        <Color x:Key="TextDimColor">#8A8A8A</Color>
+        <Color x:Key="AccentColor">#00E5FF</Color>
+        <Color x:Key="AccentDimColor">#004F5E</Color>
+        <Color x:Key="UserBubbleColor">#1A233A</Color>
+        <Color x:Key="AgentBubbleColor">#141721</Color>
+        <Color x:Key="ToolBubbleColor">#102A1E</Color>
+        <Color x:Key="ErrBubbleColor">#3A1C20</Color>
+        <Color x:Key="OkColor">#00E676</Color>
+        <Color x:Key="WarnColor">#FFB300</Color>
+        <Color x:Key="ErrColor">#FF1744</Color>
+
+        <!-- SolidColorBrushes -->
+        <SolidColorBrush x:Key="Bg" Color="{StaticResource BgColor}"/>
+        <SolidColorBrush x:Key="Panel" Color="{StaticResource PanelColor}"/>
+        <SolidColorBrush x:Key="PanelAlt" Color="{StaticResource PanelAltColor}"/>
+        <SolidColorBrush x:Key="Border" Color="{StaticResource BorderColor}"/>
+        <SolidColorBrush x:Key="Text" Color="{StaticResource TextColor}"/>
+        <SolidColorBrush x:Key="TextDim" Color="{StaticResource TextDimColor}"/>
+        <SolidColorBrush x:Key="Accent" Color="{StaticResource AccentColor}"/>
+        <SolidColorBrush x:Key="AccentDim" Color="{StaticResource AccentDimColor}"/>
+        <SolidColorBrush x:Key="UserBubble" Color="{StaticResource UserBubbleColor}"/>
+        <SolidColorBrush x:Key="AgentBubble" Color="{StaticResource AgentBubbleColor}"/>
+        <SolidColorBrush x:Key="ToolBubble" Color="{StaticResource ToolBubbleColor}"/>
+        <SolidColorBrush x:Key="ErrBubble" Color="{StaticResource ErrBubbleColor}"/>
+        <SolidColorBrush x:Key="Ok" Color="{StaticResource OkColor}"/>
+        <SolidColorBrush x:Key="Warn" Color="{StaticResource WarnColor}"/>
+        <SolidColorBrush x:Key="Err" Color="{StaticResource ErrColor}"/>
+    </Application.Resources>
+
+    <Application.Styles>
+        <FluentTheme />
+        <StyleInclude Source="avares://Avalonia.Controls.DataGrid/Themes/Fluent.xaml" />
+        <StyleInclude Source="avares://AvaloniaEdit/Themes/Fluent/AvaloniaEdit.xaml" />
+
+        <!-- Flat Button Style -->
+        <Style Selector="Button.flat">
+            <Setter Property="Background" Value="{StaticResource PanelAlt}"/>
+            <Setter Property="Foreground" Value="{StaticResource Text}"/>
+            <Setter Property="BorderBrush" Value="{StaticResource Border}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Padding" Value="12,6"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="CornerRadius" Value="6"/>
+        </Style>
+        <Style Selector="Button.flat:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="{StaticResource Border}"/>
+            <Setter Property="BorderBrush" Value="{StaticResource Border}"/>
+            <Setter Property="Foreground" Value="{StaticResource Text}"/>
+        </Style>
+
+        <!-- Accent Button Style -->
+        <Style Selector="Button.accent">
+            <Setter Property="Background" Value="{StaticResource Accent}"/>
+            <Setter Property="BorderBrush" Value="{StaticResource Accent}"/>
+            <Setter Property="Foreground" Value="Black"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Padding" Value="12,6"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="CornerRadius" Value="6"/>
+        </Style>
+        <Style Selector="Button.accent:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="#33F0FF"/>
+            <Setter Property="BorderBrush" Value="#33F0FF"/>
+            <Setter Property="Foreground" Value="Black"/>
+        </Style>
+
+        <!-- Danger Button Style -->
+        <Style Selector="Button.danger">
+            <Setter Property="Background" Value="#7A2630"/>
+            <Setter Property="BorderBrush" Value="#9A3340"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Padding" Value="12,6"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="CornerRadius" Value="6"/>
+        </Style>
+        <Style Selector="Button.danger:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="#9A3340"/>
+            <Setter Property="BorderBrush" Value="#B23E4D"/>
+            <Setter Property="Foreground" Value="White"/>
+        </Style>
+
+        <!-- Icon Button Style (Round) -->
+        <Style Selector="Button.icon">
+            <Setter Property="Background" Value="{StaticResource PanelAlt}"/>
+            <Setter Property="Foreground" Value="{StaticResource TextDim}"/>
+            <Setter Property="BorderBrush" Value="{StaticResource Border}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Width" Value="36"/>
+            <Setter Property="Height" Value="36"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="FontSize" Value="18"/>
+            <Setter Property="CornerRadius" Value="18"/>
+            <Setter Property="Padding" Value="0"/>
+            <!-- Center the glyph in both axes; without this the "+" sits off-center. -->
+            <Setter Property="HorizontalContentAlignment" Value="Center"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+        </Style>
+        <Style Selector="Button.icon:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="{StaticResource Border}"/>
+            <Setter Property="Foreground" Value="{StaticResource Text}"/>
+            <Setter Property="BorderBrush" Value="{StaticResource Border}"/>
+        </Style>
+        <!-- Selected/active state for an icon button (sidebar tab + toggled Log). -->
+        <Style Selector="Button.icon.active /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="{StaticResource AccentDim}"/>
+            <Setter Property="BorderBrush" Value="{StaticResource Accent}"/>
+            <Setter Property="Foreground" Value="{StaticResource Accent}"/>
+        </Style>
+
+        <!-- Borderless ring button: hosts the circular context-usage meter; clicking
+             it triggers a manual compaction. No chrome so only the ring shows. -->
+        <Style Selector="Button.ring">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Padding" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="CornerRadius" Value="15"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+            <Setter Property="HorizontalContentAlignment" Value="Center"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+        </Style>
+        <Style Selector="Button.ring:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="{StaticResource PanelAlt}"/>
+        </Style>
+
+        <!-- Dark TextBox Style -->
+        <Style Selector="TextBox.darkInput">
+            <Setter Property="Background" Value="{StaticResource PanelAlt}"/>
+            <Setter Property="Foreground" Value="{StaticResource Text}"/>
+            <Setter Property="CaretBrush" Value="{StaticResource Text}"/>
+            <Setter Property="BorderBrush" Value="{StaticResource Border}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Padding" Value="8,5"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="CornerRadius" Value="6"/>
+        </Style>
+        <Style Selector="TextBox.darkInput:pointerover /template/ Border#PART_BorderElement">
+            <Setter Property="BorderBrush" Value="{StaticResource Accent}"/>
+            <Setter Property="Background" Value="{StaticResource PanelAlt}"/>
+        </Style>
+        <Style Selector="TextBox.darkInput:focus /template/ Border#PART_BorderElement">
+            <Setter Property="BorderBrush" Value="{StaticResource Accent}"/>
+            <Setter Property="Background" Value="{StaticResource PanelAlt}"/>
+        </Style>
+
+        <!-- Field Label Style -->
+        <Style Selector="TextBlock.fieldLabel">
+            <Setter Property="Foreground" Value="{StaticResource TextDim}"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+        </Style>
+
+        <!-- Section Header Style -->
+        <Style Selector="TextBlock.sectionHeader">
+            <Setter Property="Foreground" Value="{StaticResource Accent}"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Margin" Value="0,18,0,8"/>
+        </Style>
+
+        <!-- Custom Usage Progress Bar Style -->
+        <Style Selector="ProgressBar.usageBar">
+            <Setter Property="Height" Value="8"/>
+            <Setter Property="Background" Value="{StaticResource PanelAlt}"/>
+            <Setter Property="Foreground" Value="{StaticResource Accent}"/>
+            <Setter Property="BorderBrush" Value="{StaticResource Border}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="CornerRadius" Value="4"/>
+        </Style>
+
+        <!-- Tag/chip badge: small rounded pill used for model store tags. Matches the
+             top-bar capability badges. Color variants (chipOk/chipAccent) recolor the
+             border + text for emphasis; the accuracy chip is colored via binding. -->
+        <Style Selector="Border.chip">
+            <Setter Property="Background" Value="{StaticResource PanelAlt}"/>
+            <Setter Property="BorderBrush" Value="{StaticResource Border}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="CornerRadius" Value="6"/>
+            <Setter Property="Padding" Value="7,2,8,2"/>
+            <Setter Property="Margin" Value="0,0,6,2"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+        </Style>
+        <Style Selector="Border.chip TextBlock">
+            <Setter Property="FontSize" Value="11"/>
+            <Setter Property="Foreground" Value="{StaticResource TextDim}"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+        </Style>
+        <Style Selector="Border.chipOk">
+            <Setter Property="BorderBrush" Value="{StaticResource Ok}"/>
+        </Style>
+        <Style Selector="Border.chipOk TextBlock">
+            <Setter Property="Foreground" Value="{StaticResource Ok}"/>
+        </Style>
+        <Style Selector="Border.chipAccent">
+            <Setter Property="BorderBrush" Value="{StaticResource Accent}"/>
+        </Style>
+        <Style Selector="Border.chipAccent TextBlock">
+            <Setter Property="Foreground" Value="{StaticResource Accent}"/>
+        </Style>
+
+        <!-- Dark ComboBox Style -->
+        <Style Selector="ComboBox.darkCombo">
+            <Setter Property="Background" Value="{StaticResource PanelAlt}"/>
+            <Setter Property="Foreground" Value="{StaticResource Text}"/>
+            <Setter Property="BorderBrush" Value="{StaticResource Border}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Height" Value="32"/>
+            <Setter Property="CornerRadius" Value="6"/>
+            <Setter Property="Padding" Value="10,0"/>
+        </Style>
+        <Style Selector="ComboBox.darkCombo:pointerover /template/ Border#Background">
+            <Setter Property="BorderBrush" Value="{StaticResource Accent}"/>
+        </Style>
+    </Application.Styles>
+</Application>

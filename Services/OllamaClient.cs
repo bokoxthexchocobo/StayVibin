@@ -5,9 +5,27 @@ using System.Text.Json;
 
 namespace StayVibin.Services;
 
-/// <summary>Metadata read from Ollama's /api/show.</summary>
+/// <summary>
+/// Metadata read from Ollama's /api/show. The architecture fields (layer/head
+/// counts and head dimension) are optional - present when the model exposes them in
+/// model_info - and are used to estimate KV-cache memory for VRAM-aware context
+/// fitting. They default to 0 when unknown.
+/// </summary>
 public sealed record ModelInfo(
-    long ContextLength, string Family, string ParameterSize, IReadOnlyList<string> Capabilities);
+    long ContextLength, string Family, string ParameterSize, IReadOnlyList<string> Capabilities,
+    int BlockCount = 0, int HeadCountKv = 0, int HeadDim = 0)
+{
+    /// <summary>
+    /// Estimated KV-cache bytes consumed per context token, given the per-element
+    /// byte cost of the cache (f16 ~ 2, q8_0 ~ 1, q4_0 ~ 0.5). Formula: 2 (K and V)
+    /// * layers * KV heads * head dimension * element bytes. Returns 0 when the
+    /// architecture metadata needed for the estimate is missing.
+    /// </summary>
+    public long KvBytesPerToken(double elementBytes)
+        => BlockCount > 0 && HeadCountKv > 0 && HeadDim > 0
+            ? (long)Math.Ceiling(2.0 * BlockCount * HeadCountKv * HeadDim * elementBytes)
+            : 0;
+}
 
 /// <summary>An installed model and its on-disk size (from /api/tags).</summary>
 public sealed record InstalledModel(string Name, long SizeBytes);
@@ -131,19 +149,38 @@ public sealed class OllamaClient : IDisposable
             using var doc = await JsonDocument.ParseAsync(stream, cancellationToken: ct);
             var root = doc.RootElement;
 
+            // Scan model_info for the native context window plus the architecture
+            // fields used to estimate KV-cache memory. Keys are namespaced by
+            // architecture (e.g. "qwen2.block_count"), so we match on the suffix.
             long ctx = 0;
+            int blockCount = 0, headCount = 0, headCountKv = 0, keyLength = 0, embeddingLength = 0;
             if (root.TryGetProperty("model_info", out var mi) && mi.ValueKind == JsonValueKind.Object)
             {
                 foreach (var p in mi.EnumerateObject())
                 {
-                    if (p.Name.EndsWith(".context_length", StringComparison.OrdinalIgnoreCase)
-                        && p.Value.ValueKind == JsonValueKind.Number)
-                    {
+                    if (p.Value.ValueKind != JsonValueKind.Number) continue;
+                    var key = p.Name;
+                    if (ctx == 0 && key.EndsWith(".context_length", StringComparison.OrdinalIgnoreCase))
                         ctx = p.Value.GetInt64();
-                        break;
-                    }
+                    else if (key.EndsWith(".block_count", StringComparison.OrdinalIgnoreCase))
+                        blockCount = p.Value.GetInt32();
+                    else if (key.EndsWith(".attention.head_count_kv", StringComparison.OrdinalIgnoreCase))
+                        headCountKv = p.Value.GetInt32();
+                    else if (key.EndsWith(".attention.head_count", StringComparison.OrdinalIgnoreCase))
+                        headCount = p.Value.GetInt32();
+                    else if (key.EndsWith(".attention.key_length", StringComparison.OrdinalIgnoreCase))
+                        keyLength = p.Value.GetInt32();
+                    else if (key.EndsWith(".embedding_length", StringComparison.OrdinalIgnoreCase))
+                        embeddingLength = p.Value.GetInt32();
                 }
             }
+
+            // KV heads default to attention heads for non-GQA models. Head dimension
+            // is the explicit key_length when present, else embedding_length / heads.
+            int kvHeads = headCountKv > 0 ? headCountKv : headCount;
+            int headDim = keyLength > 0
+                ? keyLength
+                : (headCount > 0 && embeddingLength > 0 ? embeddingLength / headCount : 0);
 
             var caps = new List<string>();
             if (root.TryGetProperty("capabilities", out var ca) && ca.ValueKind == JsonValueKind.Array)
@@ -159,7 +196,7 @@ public sealed class OllamaClient : IDisposable
                     paramSize = ps.GetString() ?? "";
             }
 
-            var info = new ModelInfo(ctx, family, paramSize, caps);
+            var info = new ModelInfo(ctx, family, paramSize, caps, blockCount, kvHeads, headDim);
             _infoCache[model] = info;
             return info;
         }
@@ -295,6 +332,36 @@ public sealed class OllamaClient : IDisposable
         catch
         {
             return Array.Empty<InstalledModel>();
+        }
+    }
+
+    /// <summary>
+    /// On-disk size in bytes of an installed model tag (from /api/tags), used to
+    /// estimate how much VRAM/RAM the weights occupy once loaded. Tries an exact tag
+    /// match, then ":latest", then a bare-name match. Returns 0 when the model is not
+    /// installed or Ollama is unreachable.
+    /// </summary>
+    public async Task<long> GetModelDiskSizeAsync(string model, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(model)) return 0;
+        var installed = await ListInstalledAsync(ct);
+        if (installed.Count == 0) return 0;
+
+        foreach (var m in installed)
+            if (string.Equals(m.Name, model, StringComparison.OrdinalIgnoreCase)) return m.SizeBytes;
+        foreach (var m in installed)
+            if (string.Equals(m.Name, model + ":latest", StringComparison.OrdinalIgnoreCase)) return m.SizeBytes;
+
+        // Bare-name fallback: "llama3.1" matches an installed "llama3.1:8b".
+        var bare = BareName(model);
+        foreach (var m in installed)
+            if (string.Equals(BareName(m.Name), bare, StringComparison.OrdinalIgnoreCase)) return m.SizeBytes;
+        return 0;
+
+        static string BareName(string tag)
+        {
+            int i = tag.IndexOf(':');
+            return i < 0 ? tag : tag[..i];
         }
     }
 

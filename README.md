@@ -1,10 +1,10 @@
 # StayVibin
 
-A native Windows (WPF / .NET 10) app for local-first AI vibe coding.
+A native desktop (Avalonia / .NET 10) app for local-first AI vibe coding.
 
-StayVibin launches its local AI engine as a child process and talks to it over
-REST + WebSocket. That keeps the engine, tools, model integrations, and streaming
-local while giving you a real native desktop app.
+StayVibin launches its own bundled AI engine as a child process and talks to it
+over REST + WebSocket. That keeps the engine, tools, model integrations, and
+streaming local while giving you a real native desktop app.
 
 This project is standalone and intentionally separate from the HCDE build and
 release pipeline. It is built on the upstream MIT-licensed OpenHands.
@@ -14,12 +14,12 @@ release pipeline. It is built on the upstream MIT-licensed OpenHands.
 ```
 +-------------------+        REST: POST /api/conversations        +------------------+
 |  StayVibin        |  ----------------------------------------->  |  agent-server    |
-|  (C#/WPF)         |        WebSocket: /sockets/events/{id}       |  (Python,        |
+|  (C#/Avalonia)    |        WebSocket: /sockets/events/{id}       |  (Python,        |
 |                   |  <-----------------------------------------  |   localhost:8000)|
 +-------------------+        live events / messages               +------------------+
                                                                       |
                                                                       v
-                                                                 Ollama / LLM
+                                                            StayVibin Engine / LLM
 ```
 
 - `Services/BackendManager.cs` - locates and launches `agent-server.exe`, waits
@@ -29,8 +29,10 @@ release pipeline. It is built on the upstream MIT-licensed OpenHands.
   models.
 - `Services/AgentServerClient.cs` - creates a conversation over REST and streams
   events over the WebSocket, normalizing them into render-ready updates.
-- `MainWindow.xaml` / `.cs` - the chat UI: messages, thoughts, tool calls,
-  results, status, and a server log panel.
+- `Services/StayVibinEngineManager.cs` - owns the bundled engine process: launch,
+  health, context/device sizing, model-runner cleanup, and teardown.
+- `MainWindow.axaml` / `.cs` - the single-window UI: chat (messages, thoughts,
+  tool calls, results), the Model Store, Settings, status, and a server log panel.
 
 ## Prerequisites
 
@@ -43,10 +45,11 @@ release pipeline. It is built on the upstream MIT-licensed OpenHands.
    ```
    The app expects `agent-server.exe` at
    `%APPDATA%\uv\tools\openhands\Scripts\agent-server.exe` (override in Settings).
-3. **Ollama** running with at least one chat model pulled (e.g.
-   `ollama pull qwen3:14b`). More local providers are planned.
-4. **A configured model** - on first launch StayVibin shows a provider setup box
-   (Ollama for now) and writes the engine settings for you.
+3. **No separate Ollama install required.** StayVibin ships and manages its own
+   bundled engine (an Ollama-compatible fork) on `127.0.0.1:11500`. You do not
+   need stock Ollama installed; if you have it, StayVibin still uses its own engine.
+4. **A model** - pull one from the in-app **Model Store** (e.g. `qwen3:14b`). On
+   first launch StayVibin configures the bundled engine for you automatically.
 
 > Note: the agent-server, sdk, and tools packages must be version-compatible.
 > This repo was validated against `openhands-sdk==1.21.0` /
@@ -67,7 +70,7 @@ powershell -ExecutionPolicy Bypass -File .\publish.ps1
 Produces a self-contained single-file executable at:
 
 ```
-bin\Release\net10.0-windows\win-x64\publish\StayVibin.exe
+bin\Release\net10.0\win-x64\publish\StayVibin.exe
 ```
 
 ## Build the Windows installer (v2.0+)
@@ -113,6 +116,55 @@ Download the latest release from
   `%APPDATA%\StayVibin`.
 - Live token streaming is rendered if the backend emits it; otherwise the final
   message is shown when the turn completes.
+
+## What's new in v3.0.0
+
+A major release: the whole UI was rebuilt and the engine/model experience was
+reworked around the bundled StayVibin Engine.
+
+- **New Avalonia UI.** Migrated from WPF to a single-window Avalonia app with a
+  compact cyber-neon theme. Chat, Model Store, and Settings now live in one
+  window with a left sidebar (Settings, Git status, Server log toggle).
+- **Cursor-style context ring.** The context meter is a circular gauge that fills
+  as the window is used and keeps the live `used / total` numbers beside it. Click
+  it to compact (summarize) the conversation on demand; auto-compaction is a
+  toggle in Settings.
+- **VRAM/RAM-aware automatic context tuning.** The context window is sized to your
+  actual hardware and the model: it fits the KV cache in VRAM for full speed, and
+  when VRAM is tight it borrows a bounded slice of system RAM to reach a usable
+  working window instead of cramming into the leftover VRAM. The engine is
+  relaunched at the resolved window so the meter, the engine, and every request
+  agree on one size. A manual "Max context" in Settings always overrides.
+- **Token-aware auto-compaction.** History is summarized based on real token count
+  (not just event count) with headroom reserved for the reply and for a large tool
+  output, which stops the engine from truncating the prompt mid-session.
+- **Compute device choice.** Run models on GPU (default) or CPU only, with a
+  recommended-hardware note for CPU mode. Switching relaunches the engine.
+- **Model Store as a marketplace.** ~110 models with honest descriptions,
+  capability tags, grouping with installed models on top, and a "Recommended for
+  your hardware" hint. An in-form **Installed models** manager lists what you have
+  with on-disk sizes, a running total, and per-model delete.
+- **Live engine telemetry in the GUI.** Tokens this turn, decode speed (t/s), and
+  prefill progress are parsed from the engine and shown live next to the meter.
+- **Standard Tool Kit (tool translator).** A translation layer maps the many
+  tool-name and argument-name dialects local models emit onto StayVibin's real
+  tools, so more models can actually drive the agent. File-read and search limits
+  were raised and workspace awareness broadened (key files + folder map) so the
+  agent explores like a frontier model instead of guessing.
+- **Plain-text thinking.** Agent reasoning shows as plain text under an animated
+  "Assistant is thinking..." header (Cursor-style) instead of a bubble.
+- **Engine lifecycle hardening.** The app adopts an already-running engine so it
+  can always shut it down, sweeps orphaned `llama-server` runners by path, and no
+  longer leaves the engine "stuck" running after close. The model stays warm on
+  **Stop** (instant restart) and is freed when you switch models, change the
+  context/device, or close the app.
+- **AMD note.** VRAM detection is vendor-neutral, but the bundled engine currently
+  accelerates NVIDIA (CUDA); AMD cards fall back to CPU. The fitter still tailors
+  the window to detected memory.
+- **Reliability fixes.** Duplicated tool-call arguments from the engine's
+  OpenAI-compatible layer, stale/stuck conversation handling, chat bottom cut-off
+  (including fullscreen), and a stale publish path that broke `publish.ps1` are all
+  fixed.
 
 ## What's new in v2.0.0
 
