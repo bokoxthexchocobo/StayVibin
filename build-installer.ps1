@@ -7,6 +7,7 @@
 
 param(
     [string]$Version = "",
+    [string]$ProductVersion = "",
     [string]$Runtime = "win-x64",
     [switch]$SkipPublish
 )
@@ -64,6 +65,20 @@ Push-Location $Root
 try {
     $csproj = Join-Path $Root "StayVibin.csproj"
     if (-not $Version) { $Version = Get-ProjectVersion $csproj }
+    if (-not $ProductVersion) {
+        # Windows version resources require a numeric dotted quad. Keep release
+        # labels like "3.0.0-hotfix.1" for display/output names, but translate the
+        # common hotfix suffix into a valid product version for Inno Setup.
+        if ($Version -match '^(\d+)\.(\d+)\.(\d+)-hotfix\.(\d+)$') {
+            $ProductVersion = "$($Matches[1]).$($Matches[2]).$($Matches[3]).$($Matches[4])"
+        }
+        elseif ($Version -match '^(\d+)\.(\d+)\.(\d+)$') {
+            $ProductVersion = "$($Matches[1]).$($Matches[2]).$($Matches[3]).0"
+        }
+        else {
+            $ProductVersion = $Version
+        }
+    }
     Write-Host "Building StayVibin v$Version"
 
     if (-not $SkipPublish) {
@@ -91,7 +106,7 @@ try {
     Write-Host "==> Compiling Windows installer..."
     $iscc = Ensure-InnoCompiler
     $iss = Join-Path $Root "installer\StayVibin.iss"
-    & $iscc "/DMyAppVersion=$Version" $iss
+    & $iscc "/DMyAppVersion=$Version" "/DMyAppProductVersion=$ProductVersion" $iss
     if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
 
     $setup = Join-Path $distDir "StayVibin-$Version-setup.exe"

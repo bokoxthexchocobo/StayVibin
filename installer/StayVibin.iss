@@ -5,6 +5,9 @@
 #ifndef MyAppVersion
   #define MyAppVersion "1.0.0"
 #endif
+#ifndef MyAppProductVersion
+  #define MyAppProductVersion "1.0.0.0"
+#endif
 #define MyAppPublisher "StayVibin"
 #define MyAppURL "https://github.com/bokoxthexchocobo/StayVibin"
 #define MyAppExeName "StayVibin.exe"
@@ -34,8 +37,8 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
-VersionInfoVersion=1.0.0.0
-VersionInfoProductVersion={#MyAppVersion}
+VersionInfoVersion={#MyAppProductVersion}
+VersionInfoProductVersion={#MyAppProductVersion}
 VersionInfoCompany={#MyAppPublisher}
 VersionInfoDescription={#MyAppName} Setup
 VersionInfoProductName={#MyAppName}

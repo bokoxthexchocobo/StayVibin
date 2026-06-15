@@ -45,6 +45,51 @@ try {
         return $null
     }
 
+    # The Go+CGO engine exe links a handful of MinGW runtime DLLs that are NOT part
+    # of a stock Windows install (the loader resolves them from the exe's own
+    # directory). They are easy to forget because they live in the toolchain bin,
+    # not in the engine's build output - which is exactly the bug that shipped an
+    # Engine\ payload missing libwinpthread-1.dll. Stage every required DLL right
+    # next to the engine exe so a clean Windows box can launch it.
+    function Stage-EngineRuntimeDlls {
+        param([Parameter(Mandatory)][string]$EngineDir)
+
+        # Currently the only non-Windows load-time import of stayvibin-engine.exe.
+        # Add more here if a future engine build pulls in additional MinGW deps
+        # (e.g. libstdc++-6.dll, libgcc_s_seh-1.dll); the search below will find them.
+        $required = @("libwinpthread-1.dll")
+
+        # Prioritized sources: a checked-in copy guarantees a reproducible bundle on
+        # any build machine, then fall back to common MinGW/MSYS2/Git toolchain bins.
+        $sourceDirs = @(
+            (Join-Path $PSScriptRoot "runtime-deps\win-x64"),
+            $EngineDir,
+            (Join-Path $env:USERPROFILE "mingw64\bin"),
+            (Join-Path $env:USERPROFILE "ucrt64\bin"),
+            "C:\msys64\mingw64\bin",
+            "C:\msys64\ucrt64\bin",
+            "C:\Program Files\Git\mingw64\bin"
+        )
+
+        foreach ($dll in $required) {
+            $dest = Join-Path $EngineDir $dll
+            if (Test-Path $dest) { continue }
+            $found = $false
+            foreach ($dir in $sourceDirs) {
+                $src = Join-Path $dir $dll
+                if (Test-Path $src) {
+                    Copy-Item $src $dest -Force
+                    Write-Host "Staged engine runtime DLL: $dll  (from $dir)"
+                    $found = $true
+                    break
+                }
+            }
+            if (-not $found) {
+                Write-Warning "Required engine runtime DLL '$dll' was not found in any known source. The published engine may fail to start. Add it to runtime-deps\win-x64\."
+            }
+        }
+    }
+
     dotnet publish .\StayVibin.csproj -c Release -r $Runtime --self-contained true `
         -p:PublishSingleFile=true `
         -p:IncludeNativeLibrariesForSelfExtract=true `
@@ -86,6 +131,12 @@ try {
         else {
             Write-Warning "Bundled StayVibin Engine payload was not found. Publish output will not contain Engine\."
         }
+    }
+
+    # Always ensure the engine's MinGW runtime DLLs are present next to the exe,
+    # whether the payload came from project Content or the fallback copy above.
+    if (Test-Path (Join-Path $engineDest "stayvibin-engine.exe")) {
+        Stage-EngineRuntimeDlls -EngineDir $engineDest
     }
 
     if (Test-Path $out) {

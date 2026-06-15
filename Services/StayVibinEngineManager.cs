@@ -71,7 +71,7 @@ public sealed class StayVibinEngineManager : IDisposable
                 Directory.CreateDirectory(Path.GetDirectoryName(bundled)!);
                 File.Copy(devExe, bundled, overwrite: true);
                 StageDirectory(devLib, bundledLib);
-                StageOptionalRuntimeDlls(bundledLib);
+                StageOptionalRuntimeDlls(bundled, bundledLib);
                 return bundled;
             }
             catch
@@ -104,20 +104,50 @@ public sealed class StayVibinEngineManager : IDisposable
         }
     }
 
-    private static void StageOptionalRuntimeDlls(string destDir)
+    /// <summary>
+    /// Stage the MinGW runtime DLLs the engine needs but that are not part of a
+    /// stock Windows install, so a dev-fallback launch works the same as a published
+    /// build. Two destinations matter:
+    ///  - libwinpthread-1.dll is a load-time import of stayvibin-engine.exe itself,
+    ///    so it must sit next to the exe (the loader searches the exe dir first).
+    ///  - libdl.dll is consumed by the lib\ollama runtime, so it goes there.
+    /// Each DLL is resolved from the first toolchain bin that has it.
+    /// </summary>
+    private static void StageOptionalRuntimeDlls(string engineExePath, string libDir)
     {
-        string[] candidates =
+        var engineDir = Path.GetDirectoryName(engineExePath) ?? libDir;
+
+        // DLL name -> destination directory.
+        var targets = new (string Dll, string Dest)[]
+        {
+            ("libwinpthread-1.dll", engineDir),
+            ("libdl.dll", libDir),
+        };
+
+        var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        string[] sourceDirs =
         [
-            Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                "mingw64", "bin", "libdl.dll"),
+            Path.Combine(AppContext.BaseDirectory, "runtime-deps", "win-x64"),
+            engineDir,
+            Path.Combine(profile, "mingw64", "bin"),
+            Path.Combine(profile, "ucrt64", "bin"),
+            @"C:\msys64\mingw64\bin",
+            @"C:\msys64\ucrt64\bin",
+            @"C:\Program Files\Git\mingw64\bin",
         ];
 
-        foreach (var source in candidates)
+        foreach (var (dll, destDir) in targets)
         {
-            if (!File.Exists(source)) continue;
-            var dest = Path.Combine(destDir, Path.GetFileName(source));
-            File.Copy(source, dest, overwrite: true);
+            var dest = Path.Combine(destDir, dll);
+            if (File.Exists(dest)) continue;
+            foreach (var dir in sourceDirs)
+            {
+                var src = Path.Combine(dir, dll);
+                if (!File.Exists(src)) continue;
+                Directory.CreateDirectory(destDir);
+                File.Copy(src, dest, overwrite: true);
+                break;
+            }
         }
     }
 
