@@ -9,6 +9,8 @@ streaming local while giving you a real native desktop app.
 This project is standalone and intentionally separate from the HCDE build and
 release pipeline. It is built on the upstream MIT-licensed OpenHands.
 
+![StayVibin desktop app](docs/screenshots/app-v3.0.0-hotfix.1.png)
+
 ## How it works
 
 ```
@@ -41,7 +43,7 @@ release pipeline. It is built on the upstream MIT-licensed OpenHands.
    first time you press **Start** (it installs `uv` if needed, then installs the
    engine package). To do it manually instead:
    ```
-   uv tool install openhands
+   uv tool install openhands --python 3.12
    ```
    The app expects `agent-server.exe` at
    `%APPDATA%\uv\tools\openhands\Scripts\agent-server.exe` (override in Settings).
