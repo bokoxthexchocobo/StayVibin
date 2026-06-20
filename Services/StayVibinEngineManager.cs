@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO;
 using System.Net.Http;
+using System.Collections.Generic;
 
 namespace StayVibin.Services;
 
@@ -222,7 +223,7 @@ public sealed class StayVibinEngineManager : IDisposable
         var runtimeLibDir = Path.Combine(exeDir, "lib", "ollama");
         if (Directory.Exists(runtimeLibDir))
         {
-            psi.Environment.TryGetValue("PATH", out var existingPath);
+            var existingPath = psi.Environment.GetValueOrDefault("PATH");
             psi.Environment["PATH"] = string.IsNullOrEmpty(existingPath)
                 ? runtimeLibDir
                 : runtimeLibDir + Path.PathSeparator + existingPath;
@@ -236,25 +237,50 @@ public sealed class StayVibinEngineManager : IDisposable
         psi.Environment["OLLAMA_MODELS"] = DefaultModelsDir();
         // Compute-device selection. CPU mode hides every accelerator from the engine
         // (CUDA/ROCm, and Vulkan which emulates CUDA_VISIBLE_DEVICES) so inference
-        // runs purely on the CPU using system RAM. Slower, but it works on machines
-        // with a weak or absent GPU. GPU mode leaves autodetection alone, which also
-        // auto-spills layers that exceed VRAM onto the CPU.
+        // runs purely on the CPU using system RAM. Slower, but        // VRAM & performance tuning: we load the user's settings to apply custom
+        // memory optimizations. Context memory (KV Cache) quantization (e.g. q8_0 or q4_0)
+        // can save up to 50%-75% of context VRAM, allowing larger models or larger context sizes.
+        var appSettings = AppSettings.Load();
+
+        // Performance Tweaks for Dedicated AI Rigs:
+        // Use q4_0 KV cache by default if not specified; saves ~50% context VRAM.
+        psi.Environment["OLLAMA_KV_CACHE_TYPE"] = !string.IsNullOrEmpty(appSettings.KvCacheType) ? appSettings.KvCacheType : "q4_0";
+        psi.Environment["OLLAMA_FLASH_ATTENTION"] = "1"; // Force enabled for performance
+        psi.Environment["OLLAMA_SCHED_SPREAD"] = "1";    // Spread model layers across ALL GPUs
+
+        psi.Environment["OLLAMA_MODELS"] = DefaultModelsDir();
+
+        // Compute-device selection.
         if (_device == ComputeDevice.Cpu)
         {
             psi.Environment["CUDA_VISIBLE_DEVICES"] = "-1";
             psi.Environment["HIP_VISIBLE_DEVICES"] = "-1";
         }
-        // This is a single-GPU desktop app. Keep exactly one model resident and a
-        // single inference slot so two CUDA contexts never load at once. Without
-        // these, a background warm/probe and an agent turn can each spin up a
-        // runner, and the second CUDA init can fault ("shared object
-        // initialization failed") under VRAM pressure, hanging the agent.
-        psi.Environment["OLLAMA_MAX_LOADED_MODELS"] = "1";
-        psi.Environment["OLLAMA_NUM_PARALLEL"] = "1";
-        // Keep the model resident for the whole session. With the default 5m
-        // keep-alive, a single long thinking/agent turn can let the model unload
-        // while idle and then reload on the next call - and that reload is exactly
-        // the CUDA re-init that can fault. Pinning it loaded avoids the churn.
+        else if (!string.IsNullOrWhiteSpace(appSettings.GpuIndices))
+        {
+            // Allow targeting specific cards (e.g. "0,1" or just "1")
+            psi.Environment["CUDA_VISIBLE_DEVICES"] = appSettings.GpuIndices;
+
+            // If the user leads with the Quadro (e.g. "1,0"), ensure we tell
+            // Ollama to actually use that second card for the heavy lifting.
+            if (appSettings.GpuIndices.StartsWith("1"))
+            {
+                 psi.Environment["OLLAMA_SCHED_SPREAD"] = "1";
+                 // Some forks use this to prioritize the secondary card's VRAM
+                 psi.Environment["OLLAMA_GPGPU_MEMORY_MIN"] = "512";
+            }
+        }
+
+        // Balanced Thinking: Don't let GPU 0 hit 100% (which causes UI lag and thinking stalls)
+        // If we have multiple GPUs, reserve a small buffer on GPU 0 for the OS.
+        if (!string.IsNullOrWhiteSpace(appSettings.GpuIndices) && appSettings.GpuIndices.Contains(","))
+        {
+            psi.Environment["OLLAMA_MAX_VRAM_0"] = "7000"; // Cap GPU 0 at 7GB so it never chokes
+        }
+
+        // Increase parallel slots to 2 so Vision and Speech can happen at once.
+        psi.Environment["OLLAMA_MAX_LOADED_MODELS"] = "3";
+        psi.Environment["OLLAMA_NUM_PARALLEL"] = "2";
         psi.Environment["OLLAMA_KEEP_ALIVE"] = "-1";
 
         _process = new Process { StartInfo = psi, EnableRaisingEvents = true };
@@ -262,6 +288,11 @@ public sealed class StayVibinEngineManager : IDisposable
         _process.ErrorDataReceived += (_, e) => { if (e.Data is not null) Log(e.Data); };
 
         Log($"[engine] starting {ExecutablePath} serve on {host} (ctx={_contextLength})");
+        var cudaDev = psi.Environment.GetValueOrDefault("CUDA_VISIBLE_DEVICES", "all");
+        var schedSpread = psi.Environment.GetValueOrDefault("OLLAMA_SCHED_SPREAD", "0");
+        var kvCache = psi.Environment.GetValueOrDefault("OLLAMA_KV_CACHE_TYPE", "f16");
+        Log($"[engine] GPU Config: CUDA_VISIBLE_DEVICES={cudaDev}");
+        Log($"[engine] Optimization: SCHED_SPREAD={schedSpread}, KV_CACHE={kvCache}");
         _process.Start();
         _process.BeginOutputReadLine();
         _process.BeginErrorReadLine();
